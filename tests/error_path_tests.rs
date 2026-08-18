@@ -173,6 +173,7 @@ fn test_reorganization_errors() {
         >,
         0,
         blvm_consensus::types::Network::Regtest,
+        None,
     );
     assert!(result.is_err());
 }

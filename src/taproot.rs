@@ -287,47 +287,83 @@ pub fn validate_taproot_transaction(tx: &Transaction, witness: Option<&Witness>)
     Ok(true)
 }
 
-/// Compute BIP341 SigMsg hash commitments from all inputs and outputs.
-///
-/// Returns (sha_prevouts, sha_amounts, sha_scriptpubkeys, sha_sequences, sha_outputs).
-/// Each is SHA256 of the concatenation of the respective field across all inputs/outputs.
+/// Shared BIP341 SigMsg commitments (N7): compute once per transaction, reuse for every input.
+#[derive(Clone, Debug)]
+pub struct Bip341PrecomputedHashes {
+    pub sha_prevouts: [u8; 32],
+    pub sha_amounts: [u8; 32],
+    pub sha_scriptpubkeys: [u8; 32],
+    pub sha_sequences: [u8; 32],
+    pub sha_outputs: [u8; 32],
+}
+
+impl Bip341PrecomputedHashes {
+    /// Compute BIP341 hash commitments from all inputs and outputs.
+    ///
+    /// Each field is SHA256 of the concatenation of the respective field across all inputs/outputs.
+    pub fn compute(
+        tx: &Transaction,
+        prevout_values: &[i64],
+        prevout_script_pubkeys: &[&[u8]],
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut prevouts_data = Vec::new();
+        let mut amounts_data = Vec::new();
+        let mut scriptpubkeys_data = Vec::new();
+        let mut sequences_data = Vec::new();
+        for (i, input) in tx.inputs.iter().enumerate() {
+            prevouts_data.extend_from_slice(&input.prevout.hash);
+            prevouts_data.extend_from_slice(&input.prevout.index.to_le_bytes());
+            // Both callers validate that prevout slices are at least as long as tx.inputs before
+            // calling this function.  Direct indexing here makes the invariant explicit; a panic
+            // would signal a programming error, not a consensus-invalid input.
+            amounts_data.extend_from_slice(&(prevout_values[i] as u64).to_le_bytes());
+            let spk = prevout_script_pubkeys[i];
+            scriptpubkeys_data.extend_from_slice(&encode_varint(spk.len() as u64));
+            scriptpubkeys_data.extend_from_slice(spk);
+            sequences_data.extend_from_slice(&(input.sequence as u32).to_le_bytes());
+        }
+        let mut outputs_data = Vec::new();
+        for output in &tx.outputs {
+            outputs_data.extend_from_slice(&(output.value as u64).to_le_bytes());
+            outputs_data.extend_from_slice(&encode_varint(output.script_pubkey.len() as u64));
+            outputs_data.extend_from_slice(&output.script_pubkey);
+        }
+
+        Self {
+            sha_prevouts: Sha256::digest(&prevouts_data).into(),
+            sha_amounts: Sha256::digest(&amounts_data).into(),
+            sha_scriptpubkeys: Sha256::digest(&scriptpubkeys_data).into(),
+            sha_sequences: Sha256::digest(&sequences_data).into(),
+            sha_outputs: Sha256::digest(&outputs_data).into(),
+        }
+    }
+}
+
+/// N7: reuse BIP341 commitments across inputs on the same thread (same `&Transaction` pointer).
+thread_local! {
+    static BIP341_TLS: std::cell::RefCell<Option<(usize, Bip341PrecomputedHashes)>> =
+        std::cell::RefCell::new(None);
+}
+
 fn bip341_precompute(
     tx: &Transaction,
     prevout_values: &[i64],
     prevout_script_pubkeys: &[&[u8]],
-) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
-    use sha2::{Digest, Sha256};
-
-    let mut prevouts_data = Vec::new();
-    let mut amounts_data = Vec::new();
-    let mut scriptpubkeys_data = Vec::new();
-    let mut sequences_data = Vec::new();
-    for (i, input) in tx.inputs.iter().enumerate() {
-        prevouts_data.extend_from_slice(&input.prevout.hash);
-        prevouts_data.extend_from_slice(&input.prevout.index.to_le_bytes());
-        // Both callers validate that prevout slices are at least as long as tx.inputs before
-        // calling this function.  Direct indexing here makes the invariant explicit; a panic
-        // would signal a programming error, not a consensus-invalid input.
-        amounts_data.extend_from_slice(&(prevout_values[i] as u64).to_le_bytes());
-        let spk = prevout_script_pubkeys[i];
-        scriptpubkeys_data.extend_from_slice(&encode_varint(spk.len() as u64));
-        scriptpubkeys_data.extend_from_slice(spk);
-        sequences_data.extend_from_slice(&(input.sequence as u32).to_le_bytes());
-    }
-    let mut outputs_data = Vec::new();
-    for output in &tx.outputs {
-        outputs_data.extend_from_slice(&(output.value as u64).to_le_bytes());
-        outputs_data.extend_from_slice(&encode_varint(output.script_pubkey.len() as u64));
-        outputs_data.extend_from_slice(&output.script_pubkey);
-    }
-
-    (
-        Sha256::digest(&prevouts_data).into(),
-        Sha256::digest(&amounts_data).into(),
-        Sha256::digest(&scriptpubkeys_data).into(),
-        Sha256::digest(&sequences_data).into(),
-        Sha256::digest(&outputs_data).into(),
-    )
+) -> Bip341PrecomputedHashes {
+    let key = tx as *const Transaction as usize;
+    BIP341_TLS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some((k, ref hashes)) = *slot {
+            if k == key {
+                return hashes.clone();
+            }
+        }
+        let hashes = Bip341PrecomputedHashes::compute(tx, prevout_values, prevout_script_pubkeys);
+        *slot = Some((key, hashes.clone()));
+        hashes
+    })
 }
 
 /// Compute Taproot key-path signature hash following BIP341.
@@ -376,8 +412,7 @@ pub fn compute_taproot_signature_hash(
         sighash_type & 0x03
     }; // DEFAULT → ALL
 
-    let (sha_prevouts, sha_amounts, sha_scriptpubkeys, sha_sequences, sha_outputs) =
-        bip341_precompute(tx, prevout_values, prevout_script_pubkeys);
+    let hashes = bip341_precompute(tx, prevout_values, prevout_script_pubkeys);
 
     let mut sigmsg = Vec::with_capacity(180);
 
@@ -392,14 +427,14 @@ pub fn compute_taproot_signature_hash(
 
     if input_type != 0x80 {
         // not ANYONECANPAY: include all-input hash commitments
-        sigmsg.extend_from_slice(&sha_prevouts);
-        sigmsg.extend_from_slice(&sha_amounts);
-        sigmsg.extend_from_slice(&sha_scriptpubkeys);
-        sigmsg.extend_from_slice(&sha_sequences);
+        sigmsg.extend_from_slice(&hashes.sha_prevouts);
+        sigmsg.extend_from_slice(&hashes.sha_amounts);
+        sigmsg.extend_from_slice(&hashes.sha_scriptpubkeys);
+        sigmsg.extend_from_slice(&hashes.sha_sequences);
     }
     if output_type == 0x01 {
         // SIGHASH_ALL: include all-output hash
-        sigmsg.extend_from_slice(&sha_outputs);
+        sigmsg.extend_from_slice(&hashes.sha_outputs);
     }
 
     // spend_type: ext_flag=0 (key path), annex_present in low bit (BIP341)
@@ -482,8 +517,7 @@ pub fn compute_tapscript_signature_hash(
         sighash_type & 0x03
     };
 
-    let (sha_prevouts, sha_amounts, sha_scriptpubkeys, sha_sequences, sha_outputs) =
-        bip341_precompute(tx, prevout_values, prevout_script_pubkeys);
+    let hashes = bip341_precompute(tx, prevout_values, prevout_script_pubkeys);
 
     let mut sigmsg = Vec::with_capacity(250);
 
@@ -497,13 +531,13 @@ pub fn compute_tapscript_signature_hash(
     sigmsg.extend_from_slice(&(tx.lock_time as u32).to_le_bytes());
 
     if input_type != 0x80 {
-        sigmsg.extend_from_slice(&sha_prevouts);
-        sigmsg.extend_from_slice(&sha_amounts);
-        sigmsg.extend_from_slice(&sha_scriptpubkeys);
-        sigmsg.extend_from_slice(&sha_sequences);
+        sigmsg.extend_from_slice(&hashes.sha_prevouts);
+        sigmsg.extend_from_slice(&hashes.sha_amounts);
+        sigmsg.extend_from_slice(&hashes.sha_scriptpubkeys);
+        sigmsg.extend_from_slice(&hashes.sha_sequences);
     }
     if output_type == 0x01 {
-        sigmsg.extend_from_slice(&sha_outputs);
+        sigmsg.extend_from_slice(&hashes.sha_outputs);
     }
 
     // spend_type: ext_flag=1 (script path); annex_present in low bit (BIP341)
@@ -732,6 +766,77 @@ mod tests {
             .collect();
         let sig_hash = compute_taproot_signature_hash(&tx, 0, &pv, &psp, 0x01, None).unwrap();
         assert_eq!(sig_hash.len(), 32);
+    }
+
+    /// N7: multi-input Taproot reuses BIP341 commitments (TLS) — bit-identical across calls.
+    #[test]
+    fn n7_bip341_tls_cache_multi_input_identical() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TransactionInput {
+                    prevout: OutPoint {
+                        hash: [1u8; 32],
+                        index: 0,
+                    },
+                    script_sig: vec![],
+                    sequence: 0xffffffff,
+                },
+                TransactionInput {
+                    prevout: OutPoint {
+                        hash: [2u8; 32],
+                        index: 1,
+                    },
+                    script_sig: vec![],
+                    sequence: 0xffffffff,
+                },
+            ]
+            .into(),
+            outputs: vec![TransactionOutput {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }]
+            .into(),
+            lock_time: 0,
+        };
+        let prevouts = [
+            TransactionOutput {
+                value: 2000,
+                script_pubkey: create_taproot_script(&[1u8; 32]),
+            },
+            TransactionOutput {
+                value: 3000,
+                script_pubkey: create_taproot_script(&[2u8; 32]),
+            },
+        ];
+        let pv: Vec<i64> = prevouts.iter().map(|p| p.value).collect();
+        let psp: Vec<&[u8]> = prevouts
+            .iter()
+            .map(|p| p.script_pubkey.as_slice())
+            .collect();
+        let h0 = compute_taproot_signature_hash(&tx, 0, &pv, &psp, 0x01, None).unwrap();
+        let h1 = compute_taproot_signature_hash(&tx, 1, &pv, &psp, 0x01, None).unwrap();
+        assert_ne!(h0, h1);
+        // Explicit compute matches TLS path (second call hits cache).
+        let direct = Bip341PrecomputedHashes::compute(&tx, &pv, &psp);
+        let cached = bip341_precompute(&tx, &pv, &psp);
+        assert_eq!(direct.sha_prevouts, cached.sha_prevouts);
+        assert_eq!(direct.sha_outputs, cached.sha_outputs);
+        let t0 = std::time::Instant::now();
+        for _ in 0..500 {
+            let _ = bip341_precompute(&tx, &pv, &psp);
+        }
+        let cached_ns = t0.elapsed().as_nanos() / 500;
+        let t1 = std::time::Instant::now();
+        for _ in 0..500 {
+            let _ = Bip341PrecomputedHashes::compute(&tx, &pv, &psp);
+        }
+        let fresh_ns = t1.elapsed().as_nanos() / 500;
+        eprintln!("[N7 micro] bip341 TLS≈{cached_ns} ns/op fresh≈{fresh_ns} ns/op");
+        assert!(
+            cached_ns < fresh_ns,
+            "TLS cache should beat full bip341_precompute"
+        );
     }
 
     #[test]

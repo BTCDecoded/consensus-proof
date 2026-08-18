@@ -81,6 +81,8 @@ pub fn check_signet_block_solution(block: &Block, challenge: &[u8], height: u64)
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
 }
 

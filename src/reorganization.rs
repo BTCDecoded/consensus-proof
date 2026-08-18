@@ -38,26 +38,34 @@ pub fn reorganize_chain(
         }
     }
 
-    // Precondition assertions: Validate function inputs
-    assert!(
-        current_height <= i64::MAX as u64,
-        "Current height {current_height} must fit in i64"
-    );
-    assert!(
-        current_utxo_set.len() <= u32::MAX as usize,
-        "Current UTXO set size {} exceeds maximum",
-        current_utxo_set.len()
-    );
-    assert!(
-        new_chain.len() <= 10_000,
-        "New chain length {} must be reasonable",
-        new_chain.len()
-    );
-    assert!(
-        current_chain.len() <= 10_000,
-        "Current chain length {} must be reasonable",
-        current_chain.len()
-    );
+    if current_height > i64::MAX as u64 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("Current height {current_height} must fit in i64").into(),
+        ));
+    }
+    if current_utxo_set.len() > u32::MAX as usize {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Current UTXO set size {} exceeds maximum",
+                current_utxo_set.len()
+            )
+            .into(),
+        ));
+    }
+    if new_chain.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("New chain length {} must be reasonable", new_chain.len()).into(),
+        ));
+    }
+    if current_chain.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Current chain length {} must be reasonable",
+                current_chain.len()
+            )
+            .into(),
+        ));
+    }
 
     // Empty per-input witness stacks (legacy path only; SegWit rejected above).
     let empty_witnesses: Vec<Vec<Vec<Witness>>> = new_chain
@@ -70,9 +78,9 @@ pub fn reorganize_chain(
                 .collect()
         })
         .collect();
-    // Invariant assertion: Witness count must match block count
-    assert!(
-        empty_witnesses.len() == new_chain.len(),
+    debug_assert_eq!(
+        empty_witnesses.len(),
+        new_chain.len(),
         "Witness count {} must match new chain block count {}",
         empty_witnesses.len(),
         new_chain.len()
@@ -96,6 +104,7 @@ pub fn reorganize_chain(
             .unwrap_or(0)
             .saturating_add(crate::constants::MAX_FUTURE_BLOCK_TIME),
         network,
+        None,
     )
 }
 
@@ -137,33 +146,53 @@ pub fn reorganize_chain_with_witnesses(
     store_undo_log_for_block: Option<impl Fn(&Hash, &BlockUndoLog) -> Result<()>>,
     network_time: u64,
     network: crate::types::Network,
+    mut connect_context_for_height: Option<
+        &mut dyn FnMut(
+            u64,
+            Option<&[BlockHeader]>,
+            u64,
+            crate::types::Network,
+        ) -> crate::block::BlockValidationContext,
+    >,
 ) -> Result<ReorganizationResult> {
-    // Precondition assertions: Validate function inputs
-    assert!(
-        current_height <= i64::MAX as u64,
-        "Current height {current_height} must fit in i64"
-    );
-    assert!(
-        current_utxo_set.len() <= u32::MAX as usize,
-        "Current UTXO set size {} exceeds maximum",
-        current_utxo_set.len()
-    );
-    assert!(
-        new_chain.len() <= 10_000,
-        "New chain length {} must be reasonable",
-        new_chain.len()
-    );
-    assert!(
-        current_chain.len() <= 10_000,
-        "Current chain length {} must be reasonable",
-        current_chain.len()
-    );
-    assert!(
-        new_chain_witnesses.len() == new_chain.len(),
-        "New chain witness count {} must match block count {}",
-        new_chain_witnesses.len(),
-        new_chain.len()
-    );
+    if current_height > i64::MAX as u64 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("Current height {current_height} must fit in i64").into(),
+        ));
+    }
+    if current_utxo_set.len() > u32::MAX as usize {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Current UTXO set size {} exceeds maximum",
+                current_utxo_set.len()
+            )
+            .into(),
+        ));
+    }
+    if new_chain.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("New chain length {} must be reasonable", new_chain.len()).into(),
+        ));
+    }
+    if current_chain.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Current chain length {} must be reasonable",
+                current_chain.len()
+            )
+            .into(),
+        ));
+    }
+    if new_chain_witnesses.len() != new_chain.len() {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "New chain witness count {} must match block count {}",
+                new_chain_witnesses.len(),
+                new_chain.len()
+            )
+            .into(),
+        ));
+    }
 
     // 1. Find common ancestor by comparing block hashes
     let common_ancestor = find_common_ancestor(new_chain, current_chain)?;
@@ -171,19 +200,24 @@ pub fn reorganize_chain_with_witnesses(
     let common_ancestor_index = common_ancestor.new_chain_index;
     let current_ancestor_index = common_ancestor.current_chain_index;
 
-    // Invariant assertion: Common ancestor indices must be valid
-    assert!(
-        common_ancestor_index < new_chain.len(),
-        "Common ancestor index {} must be < new chain length {}",
-        common_ancestor_index,
-        new_chain.len()
-    );
-    assert!(
-        current_ancestor_index < current_chain.len(),
-        "Common ancestor index {} must be < current chain length {}",
-        current_ancestor_index,
-        current_chain.len()
-    );
+    if common_ancestor_index >= new_chain.len() {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Common ancestor index {common_ancestor_index} must be < new chain length {}",
+                new_chain.len()
+            )
+            .into(),
+        ));
+    }
+    if current_ancestor_index >= current_chain.len() {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Common ancestor index {current_ancestor_index} must be < current chain length {}",
+                current_chain.len()
+            )
+            .into(),
+        ));
+    }
 
     // 2. Disconnect blocks from current chain back to common ancestor
     // We disconnect from (current_ancestor_index + 1) to the tip
@@ -191,43 +225,40 @@ pub fn reorganize_chain_with_witnesses(
     // The node layer (blvm-node) should provide a callback that uses BlockStore::get_undo_log()
     // to retrieve undo logs from the database (redb/sled).
     let mut utxo_set = current_utxo_set;
-    // Invariant assertion: UTXO set size must be reasonable
-    assert!(
-        utxo_set.len() <= u32::MAX as usize,
-        "UTXO set size {} must not exceed maximum",
-        utxo_set.len()
-    );
+    if utxo_set.len() > u32::MAX as usize {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("UTXO set size {} must not exceed maximum", utxo_set.len()).into(),
+        ));
+    }
 
     // Disconnect from the block after the common ancestor to the tip
     let disconnect_start = current_ancestor_index + 1;
-    // Invariant assertion: Disconnect start must be valid
-    assert!(
-        disconnect_start <= current_chain.len(),
-        "Disconnect start {} must be <= current chain length {}",
-        disconnect_start,
-        current_chain.len()
-    );
+    if disconnect_start > current_chain.len() {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Disconnect start {disconnect_start} must be <= current chain length {}",
+                current_chain.len()
+            )
+            .into(),
+        ));
+    }
 
     let mut disconnected_undo_logs: HashMap<Hash, BlockUndoLog> = HashMap::new();
-    // Invariant assertion: Disconnected undo logs must start empty
-    assert!(
-        disconnected_undo_logs.is_empty(),
-        "Disconnected undo logs must start empty"
-    );
 
     for i in (disconnect_start..current_chain.len()).rev() {
-        // Bounds checking assertion: Block index must be valid
-        assert!(i < current_chain.len(), "Block index {i} out of bounds");
         if let Some(block) = current_chain.get(i) {
-            // Invariant assertion: Block must have transactions
-            assert!(
-                !block.transactions.is_empty(),
-                "Block at index {i} must have at least one transaction"
-            );
+            if block.transactions.is_empty() {
+                return Err(crate::error::ConsensusError::BlockValidation(
+                    format!("Block at index {i} must have at least one transaction").into(),
+                ));
+            }
 
             let block_hash = calculate_block_hash(&block.header);
-            // Invariant assertion: Block hash must be non-zero
-            assert!(block_hash != [0u8; 32], "Block hash must be non-zero");
+            if block_hash == [0u8; 32] {
+                return Err(crate::error::ConsensusError::BlockValidation(
+                    "Block hash must be non-zero".into(),
+                ));
+            }
 
             // Retrieve undo log from persistent storage via callback
             // The callback should use BlockStore::get_undo_log() which reads from the database
@@ -292,11 +323,15 @@ pub fn reorganize_chain_with_witnesses(
             None
         };
 
-        let context = crate::block::block_validation_context_for_connect_ibd(
-            recent_headers,
-            network_time,
-            network,
-        );
+        let context = if let Some(build) = connect_context_for_height.as_mut() {
+            build(new_height, recent_headers, network_time, network)
+        } else {
+            crate::block::block_validation_context_for_connect_ibd(
+                recent_headers,
+                network_time,
+                network,
+            )
+        };
         let (validation_result, new_utxo_set, undo_log) =
             connect_block(block, &witnesses, utxo_set, new_height, &context)?;
 
@@ -574,6 +609,20 @@ struct CommonAncestorResult {
 /// full chains collected genesis-to-tip (unlike tip-distance comparison, which
 /// misaligns when fork branches differ in length).
 /// Orange Paper 11.3: Chain reorganization finds common ancestor before disconnect/connect.
+/// Height of the common ancestor when reorganizing from `current_chain` at `current_height`.
+pub fn common_ancestor_height_at_reorg(
+    current_height: u64,
+    current_chain: &[Block],
+    new_chain: &[Block],
+) -> Result<u64> {
+    let ca = find_common_ancestor(new_chain, current_chain)?;
+    let blocks_after = current_chain
+        .len()
+        .saturating_sub(1)
+        .saturating_sub(ca.current_chain_index);
+    Ok(current_height.saturating_sub(blocks_after as u64))
+}
+
 fn find_common_ancestor(
     new_chain: &[Block],
     current_chain: &[Block],
@@ -628,32 +677,34 @@ fn disconnect_block(
     mut utxo_set: UtxoSet,
     _height: Natural,
 ) -> Result<UtxoSet> {
-    // Precondition assertions: Validate function inputs
-    assert!(
-        !_block.transactions.is_empty(),
-        "Block must have at least one transaction"
-    );
-    assert!(
-        _height <= i64::MAX as u64,
-        "Block height {_height} must fit in i64"
-    );
-    assert!(
-        utxo_set.len() <= u32::MAX as usize,
-        "UTXO set size {} must not exceed maximum",
-        utxo_set.len()
-    );
-    // Invariant assertion: Undo log entry count must be reasonable
-    assert!(
-        undo_log.entries.len() <= 10_000,
-        "Undo log entry count {} must be reasonable",
-        undo_log.entries.len()
-    );
+    if _block.transactions.is_empty() {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            "Block must have at least one transaction".into(),
+        ));
+    }
+    if _height > i64::MAX as u64 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("Block height {_height} must fit in i64").into(),
+        ));
+    }
+    if utxo_set.len() > u32::MAX as usize {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("UTXO set size {} must not exceed maximum", utxo_set.len()).into(),
+        ));
+    }
+    if undo_log.entries.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Undo log entry count {} must be reasonable",
+                undo_log.entries.len()
+            )
+            .into(),
+        ));
+    }
 
     // Process undo entries in reverse order (most recent first)
     // This reverses the order of operations from connect_block
-    for (i, entry) in undo_log.entries.iter().enumerate() {
-        // Bounds checking assertion: Entry index must be valid
-        assert!(i < undo_log.entries.len(), "Entry index {i} out of bounds");
+    for entry in undo_log.entries.iter() {
         // Remove new UTXO (if it was created by this block)
         if entry.new_utxo.is_some() {
             utxo_set.remove(&entry.outpoint);
@@ -673,17 +724,20 @@ fn disconnect_block(
 #[allow(clippy::redundant_comparisons)] // Intentional assertions for formal verification
 #[spec_locked("11.3", "ShouldReorganize")]
 pub fn should_reorganize(new_chain: &[Block], current_chain: &[Block]) -> Result<bool> {
-    // Precondition assertions: Validate function inputs
-    assert!(
-        new_chain.len() <= 10_000,
-        "New chain length {} must be reasonable",
-        new_chain.len()
-    );
-    assert!(
-        current_chain.len() <= 10_000,
-        "Current chain length {} must be reasonable",
-        current_chain.len()
-    );
+    if new_chain.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("New chain length {} must be reasonable", new_chain.len()).into(),
+        ));
+    }
+    if current_chain.len() > 10_000 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!(
+                "Current chain length {} must be reasonable",
+                current_chain.len()
+            )
+            .into(),
+        ));
+    }
 
     // Reorganize when new chain has strictly more cumulative work.
     let new_work = calculate_chain_work(new_chain)?;
@@ -1049,6 +1103,7 @@ mod tests {
             None::<fn(&Hash, &BlockUndoLog) -> Result<()>>,
             reorg_network_time(new_chain),
             crate::types::Network::Regtest,
+            None,
         )
     }
 
@@ -1315,6 +1370,7 @@ mod tests {
             None::<fn(&Hash, &BlockUndoLog) -> Result<()>>, // No storage in test
             2_000_000_000,
             crate::types::Network::Regtest,
+            None,
         );
 
         // Reorganization should succeed (or fail gracefully)

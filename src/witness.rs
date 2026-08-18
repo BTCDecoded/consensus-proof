@@ -138,6 +138,35 @@ pub fn weight_to_vsize(weight: Natural) -> Natural {
     result
 }
 
+/// True when `scriptPubKey` is a witness program that is not standard v0 (P2WPKH/P2WSH) or v1 P2TR.
+///
+/// Used with `SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM`.
+#[inline]
+pub fn is_upgradable_witness_program(script: &[u8]) -> bool {
+    if script.len() < 4 {
+        return false;
+    }
+    let version = script[0];
+    if version > OP_16 {
+        return false;
+    }
+    let push = script[1];
+    if !(0x02..=0x28).contains(&push) {
+        return false;
+    }
+    let program_len = push as usize;
+    if script.len() != 2 + program_len {
+        return false;
+    }
+    if version == OP_0 {
+        return program_len != 20 && program_len != 32;
+    }
+    if version == OP_1 && program_len == 32 {
+        return false;
+    }
+    true
+}
+
 /// Validate witness version in scriptPubKey
 ///
 /// Shared function for extracting and validating witness version

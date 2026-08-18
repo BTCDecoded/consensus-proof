@@ -636,6 +636,7 @@ fn test_reorganize_chain() {
         >,
         network_time,
         Network::Regtest,
+        None,
     );
 
     assert!(

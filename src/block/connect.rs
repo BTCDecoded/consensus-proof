@@ -17,7 +17,10 @@ use crate::segwit::{Witness, validate_witness_commitment};
 use crate::transaction::check_tx_inputs;
 use crate::transaction::{check_transaction, is_coinbase};
 use crate::types::*;
-use crate::utxo_overlay::{UtxoOverlay, apply_transaction_to_overlay_no_undo};
+use crate::utxo_overlay::{
+    UtxoOverlay, apply_transaction_to_overlay_no_undo_cached,
+    build_block_output_utxo_cache,
+};
 use crate::witness::is_witness_empty;
 use std::borrow::Cow;
 
@@ -166,6 +169,21 @@ fn use_per_sig_schnorr() -> bool {
     })
 }
 
+/// Opt-out: `BLVM_ECDSA_BATCH=0` restores per-sig P2PKH secp (REVERT path).
+#[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+fn use_ecdsa_batch_collect() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match std::env::var("BLVM_ECDSA_BATCH") {
+            Ok(s) if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") => {
+                false
+            }
+            _ => true,
+        }
+    })
+}
+
 #[cfg(all(feature = "production", feature = "rayon"))]
 #[allow(dead_code)]
 fn n_crypto_drain_threads() -> usize {
@@ -195,51 +213,113 @@ fn n_crypto_drain_threads() -> usize {
 /// prevout script).
 #[cfg(feature = "production")]
 #[allow(dead_code)] // legacy sequential paths; production+rayon uses ScriptCheckQueue
+/// HASH160(pubkey) from a standard P2PKH scriptSig (`<sig> <pubkey>`).
+#[cfg(feature = "production")]
+fn try_precompute_p2pkh_hash160(script_sig: &[u8]) -> Option<[u8; 20]> {
+    use digest::Digest;
+    let (_, pubkey) = crate::script::parse_p2pkh_script_sig(script_sig)?;
+    if pubkey.len() != 33 && pubkey.len() != 65 {
+        return None;
+    }
+    let sha256_hash = crate::crypto::OptimizedSha256::new().hash(pubkey);
+    Some(ripemd::Ripemd160::digest(sha256_hash).into())
+}
+
+/// Per-input legacy P2PKH sighash precompute for IBD.
+/// - All inputs plain P2PKH SIGHASH_ALL (0x01 or legacy 0x00): forward-midstate batch.
+/// - Mixed txs: fill eligible P2PKH ALL slots only (was all-or-nothing → total miss).
+/// - Single-input: leave None (worker path; avoid serializing the common case).
+///
+/// Note: midstate-on-mixed + n==1 precompute REVERT S10 184 vs champ 197.9 (2026-07-31).
+#[cfg(feature = "production")]
 fn try_batch_precompute_sighashes_ibd(
     tx: &crate::types::Transaction,
     prevout_script_pubkeys: &[&[u8]],
-) -> Option<Vec<[u8; 32]>> {
+) -> Vec<Option<[u8; 32]>> {
     const P2PKH_LEN: usize = 25;
     let n = tx.inputs.len();
+    let mut out = vec![None; n];
     if n < 2 || prevout_script_pubkeys.len() != n {
-        return None;
+        return out;
     }
+
     let mut script_codes: Vec<&[u8]> = Vec::with_capacity(n);
     let mut sighash_bytes: Vec<u8> = Vec::with_capacity(n);
+    let mut eligible: Vec<bool> = Vec::with_capacity(n);
+    let mut all_eligible = true;
+
     for (i, input) in tx.inputs.iter().enumerate() {
         let spk = prevout_script_pubkeys[i];
-        // P2PKH: OP_DUP OP_HASH160 <20B> OP_EQUALVERIFY OP_CHECKSIG
-        if spk.len() != P2PKH_LEN
-            || spk[0] != 0x76 // OP_DUP
-            || spk[1] != 0xa9 // OP_HASH160
-            || spk[2] != 0x14 // push 20 bytes
-            || spk[23] != 0x88 // OP_EQUALVERIFY
-            || spk[24] != 0xac
-        // OP_CHECKSIG
-        {
-            return None;
+        let ok = spk.len() == P2PKH_LEN
+            && spk[0] == 0x76 // OP_DUP
+            && spk[1] == 0xa9 // OP_HASH160
+            && spk[2] == 0x14 // push 20
+            && spk[23] == 0x88 // OP_EQUALVERIFY
+            && spk[24] == 0xac; // OP_CHECKSIG
+        if !ok {
+            eligible.push(false);
+            all_eligible = false;
+            script_codes.push(&[]);
+            sighash_bytes.push(0);
+            continue;
         }
-        script_codes.push(spk);
         let ss = input.script_sig.as_slice();
-        let (sig_slice, _) = crate::script::parse_p2pkh_script_sig(ss)?;
+        let Some((sig_slice, _)) = crate::script::parse_p2pkh_script_sig(ss) else {
+            eligible.push(false);
+            all_eligible = false;
+            script_codes.push(&[]);
+            sighash_bytes.push(0);
+            continue;
+        };
         if sig_slice.is_empty() {
-            return None;
+            eligible.push(false);
+            all_eligible = false;
+            script_codes.push(&[]);
+            sighash_bytes.push(0);
+            continue;
         }
         let sh = sig_slice[sig_slice.len() - 1];
         let sighash_u32 = sh as u32;
         let base = sighash_u32 & 0x1f;
         let acp = sighash_u32 & 0x80;
-        // Must match `compute_sighashes_batch` fast-path eligibility (plain SIGHASH_ALL only).
-        if base != 0x01 || acp != 0 {
-            return None;
+        // Plain SIGHASH_ALL: 0x01 or legacy 0x00 (matches compute_sighashes_batch).
+        if acp != 0 || (base != 0x01 && base != 0x00) {
+            eligible.push(false);
+            all_eligible = false;
+            script_codes.push(&[]);
+            sighash_bytes.push(0);
+            continue;
         }
+        eligible.push(true);
+        script_codes.push(spk);
         sighash_bytes.push(sh);
     }
-    Some(crate::transaction_hash::compute_sighashes_batch(
-        tx,
-        &script_codes,
-        &sighash_bytes,
-    ))
+
+    if all_eligible {
+        let hashes = crate::transaction_hash::compute_sighashes_batch(
+            tx,
+            &script_codes,
+            &sighash_bytes,
+        );
+        for (i, h) in hashes.into_iter().enumerate() {
+            out[i] = Some(h);
+        }
+        return out;
+    }
+
+    // Mixed: still precompute eligible P2PKH ALL inputs (nocache; no midstate share).
+    for i in 0..n {
+        if !eligible[i] {
+            continue;
+        }
+        out[i] = Some(crate::transaction_hash::compute_legacy_sighash_nocache(
+            tx,
+            i,
+            script_codes[i],
+            sighash_bytes[i],
+        ));
+    }
+    out
 }
 
 #[cfg(all(feature = "production", feature = "rayon"))]
@@ -276,6 +356,7 @@ pub(crate) fn connect_block_inner<'a>(
     block_arc: Option<std::sync::Arc<Block>>,
     ibd_mode: bool,
     best_header_chainwork: Option<crate::pow::U256>,
+    ibd_utxo_lookup: Option<&dyn crate::utxo_overlay::UtxoLookup>,
 ) -> Result<(
     ValidationResult,
     UtxoSet,
@@ -637,8 +718,12 @@ pub(crate) fn connect_block_inner<'a>(
 
     // When use_overlay_delta, extract additions/deletions from the overlay built during validation
     // instead of rebuilding (avoids ~10k redundant map ops/block).
+    // Store overlay changes (not the overlay itself) so base can be `dyn UtxoLookup` (W2-1).
     #[cfg(feature = "production")]
-    let mut overlay_for_delta: Option<UtxoOverlay> = None;
+    let mut overlay_for_delta: Option<(
+        rustc_hash::FxHashMap<OutPoint, std::sync::Arc<UTXO>>,
+        rustc_hash::FxHashSet<crate::utxo_overlay::UtxoDeletionKey>,
+    )> = None;
 
     #[cfg(feature = "production")]
     {
@@ -680,11 +765,34 @@ pub(crate) fn connect_block_inner<'a>(
             // This allows transactions to spend outputs from earlier transactions in the same block
             // UtxoOverlay is O(1) creation vs O(n) clone of the full UTXO set
             // Pre-allocate overlay with capacity (computed above)
-            let mut overlay = UtxoOverlay::with_capacity(
-                &utxo_set,
-                estimated_outputs.max(100),
-                estimated_inputs.max(100),
-            );
+            let mut overlay: UtxoOverlay<'_, dyn crate::utxo_overlay::UtxoLookup> =
+                if let Some(lookup) = ibd_utxo_lookup {
+                    UtxoOverlay::with_capacity(
+                        lookup,
+                        estimated_outputs.max(100),
+                        estimated_inputs.max(100),
+                    )
+                } else {
+                    UtxoOverlay::with_capacity(
+                        &utxo_set as &dyn crate::utxo_overlay::UtxoLookup,
+                        estimated_outputs.max(100),
+                        estimated_inputs.max(100),
+                    )
+                };
+            // IBD: reuse pre-built output Arc map (I2). Safe on AV=0 after nested-P2WSH
+            // fast-path gate (497110); set was previously blamed during bisect.
+            let local_ibd_output_cache;
+            let ibd_output_cache_ref = if ibd_mode {
+                if let Some(ref arc) = context.ibd_block_outputs {
+                    Some(arc.as_ref())
+                } else {
+                    local_ibd_output_cache =
+                        build_block_output_utxo_cache(block, tx_ids, height);
+                    Some(&local_ibd_output_cache)
+                }
+            } else {
+                None
+            };
             let mut validation_results: Vec<Result<(ValidationResult, i64, bool)>> =
                 Vec::with_capacity(block.transactions.len());
             // NOTE: Undo entries are created when applying to real UTXO set, not during validation
@@ -787,6 +895,17 @@ pub(crate) fn connect_block_inner<'a>(
             let block_schnorr_collector = Arc::new(
                 crate::bip348::SchnorrSignatureCollector::new_with_capacity(total_ecdsa_inputs),
             );
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            let ecdsa_collect_threads = crate::ecdsa_timers::collect_threads();
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            let block_ecdsa_collector = Arc::new(
+                crate::ecdsa_batch::EcdsaSignatureCollector::new_with_capacity_mode(
+                    // Headroom for CHECKMULTISIG cartesian trials (overflow still works).
+                    total_ecdsa_inputs.saturating_mul(4).max(total_ecdsa_inputs),
+                    // Lock-free SoA only when single-threaded collect.
+                    ibd_mode && ecdsa_collect_threads < 2,
+                ),
+            );
 
             // Hoist for parallel block validation
             // Caller MUST pass Some(Arc<Block>) to avoid full block clone — see connect_block_ibd.
@@ -851,10 +970,15 @@ pub(crate) fn connect_block_inner<'a>(
                 let mut utxo_data_reusable: Vec<Option<(i64, bool, u64)>> = Vec::with_capacity(256);
                 let mut block_checks_buf: Vec<crate::checkqueue::ScriptCheck> =
                     Vec::with_capacity(total_inputs.min(2048));
+                // Indexed by ecdsa_index_base + input_idx (same dense space as ECDSA collect).
+                // Filled for non-SegWit multi-input P2PKH/SIGHASH_ALL txs via midstate batch;
+                // None = worker computes on demand (verify_p2pkh_inline).
                 #[cfg(feature = "production")]
-                let precomputed_sighashes: Vec<Option<[u8; 32]>> = Vec::new();
+                let mut precomputed_sighashes: Vec<Option<[u8; 32]>> =
+                    Vec::with_capacity(total_inputs);
                 #[cfg(feature = "production")]
-                let precomputed_p2pkh_hashes: Vec<Option<[u8; 20]>> = Vec::new();
+                let mut precomputed_p2pkh_hashes: Vec<Option<[u8; 20]>> =
+                    Vec::with_capacity(total_inputs);
                 #[cfg(all(feature = "production", feature = "profile"))]
                 {
                     let _ = crate::script_profile::get_and_reset_script_sub_timing();
@@ -936,6 +1060,7 @@ pub(crate) fn connect_block_inner<'a>(
                             // Sigop counting skipped: assume-valid guarantees network consensus
                             // already accepted this block's sigop cost as valid. total_sigop_cost
                             // stays 0 and trivially passes the MAX_BLOCK_SIGOPS_COST check below.
+                            // N4: also skip BIP54 per-tx sigop under skip_signatures (same trust).
                             let (input_valid, fee) =
                                 match crate::transaction::check_tx_inputs_with_owned_data(
                                     tx,
@@ -948,17 +1073,6 @@ pub(crate) fn connect_block_inner<'a>(
                                         break;
                                     }
                                 };
-                            if let Some(msg) = crate::bip_validation::check_bip54_sigop_limit(
-                                bip54_active,
-                                tx,
-                                &overlay,
-                                wits_i,
-                                tx_flags_i,
-                            )? {
-                                early_return =
-                                    Some(Ok(ConnectQueueEarlyExit::Invalid(msg.to_string())));
-                                break;
-                            }
                             (input_valid, fee, (0, 0), (0, 0))
                         } else {
                             // Full path: build utxo_refs for sigop + script check buffers.
@@ -1070,7 +1184,13 @@ pub(crate) fn connect_block_inner<'a>(
 
                     if is_coinbase(tx) || skip_signatures {
                         let tx_id = tx_ids[i];
-                        apply_transaction_to_overlay_no_undo(&mut overlay, tx, tx_id, height);
+                        apply_transaction_to_overlay_no_undo_cached(
+                            &mut overlay,
+                            tx,
+                            tx_id,
+                            height,
+                            ibd_output_cache_ref,
+                        );
                         queue_results[loop_idx] = Some(Ok((ValidationResult::Valid, fee, true)));
                         continue;
                     }
@@ -1125,19 +1245,72 @@ pub(crate) fn connect_block_inner<'a>(
                                     results_arc.push(synthetic);
                                     queue_results[loop_idx] =
                                         Some(Ok((ValidationResult::Valid, fee, true)));
+                                    #[cfg(feature = "production")]
+                                    {
+                                        // Keep precomp vecs aligned with ecdsa_index_base.
+                                        let n = tx.inputs.len();
+                                        precomputed_sighashes
+                                            .extend(std::iter::repeat_n(None, n));
+                                        precomputed_p2pkh_hashes
+                                            .extend(std::iter::repeat_n(None, n));
+                                    }
                                     ecdsa_index_base += tx.inputs.len();
                                     let tx_id = tx_ids[i];
-                                    apply_transaction_to_overlay_no_undo(
+                                    apply_transaction_to_overlay_no_undo_cached(
                                         &mut overlay,
                                         tx,
                                         tx_id,
                                         height,
+                                        ibd_output_cache_ref,
                                     );
                                     continue;
                                 }
                             }
                         }
                     }
+                    // Legacy P2PKH/SIGHASH_ALL: midstate-share all sighashes once per tx
+                    // (same helper as sequential connect). Workers read by ecdsa index.
+                    #[cfg(feature = "production")]
+                    {
+                        debug_assert_eq!(precomputed_sighashes.len(), ecdsa_index_base);
+                        let n_in = tx.inputs.len();
+                        if !has_wit_i && n_in >= 2 {
+                            let mut spks: Vec<&[u8]> = Vec::with_capacity(n_in);
+                            let mut ok = true;
+                            for j in 0..n_in {
+                                let (spk_off, spk_l) = if j < spi_count {
+                                    spi[spi_base + j]
+                                } else {
+                                    ok = false;
+                                    break;
+                                };
+                                let end = spk_off.saturating_add(spk_l);
+                                if end > script_pubkey_vec.len() {
+                                    ok = false;
+                                    break;
+                                }
+                                spks.push(&script_pubkey_vec[spk_off..end]);
+                            }
+                            if ok {
+                                precomputed_sighashes
+                                    .extend(try_batch_precompute_sighashes_ibd(tx, &spks));
+                            } else {
+                                precomputed_sighashes
+                                    .extend(std::iter::repeat_n(None, n_in));
+                            }
+                        } else {
+                            precomputed_sighashes
+                                .extend(std::iter::repeat_n(None, n_in));
+                        }
+                        // HASH160(pubkey) for every parseable P2PKH scriptSig (any n_in).
+                        debug_assert_eq!(precomputed_p2pkh_hashes.len(), ecdsa_index_base);
+                        for j in 0..n_in {
+                            precomputed_p2pkh_hashes.push(try_precompute_p2pkh_hash160(
+                                tx.inputs[j].script_sig.as_slice(),
+                            ));
+                        }
+                    }
+
                     for j in 0..tx.inputs.len() {
                         let (spk_off, spk_l) = if j < spi_count {
                             spi[spi_base + j]
@@ -1145,19 +1318,27 @@ pub(crate) fn connect_block_inner<'a>(
                             (0, 0)
                         };
                         let pv_val = if j < pv_count { pv[pv_base + j] } else { 0 };
+                        let input_flags = flags;
                         block_checks_buf.push(crate::checkqueue::ScriptCheck {
                             tx_ctx_idx,
                             input_idx: j,
                             spk_offset: spk_off as u32,
                             spk_len: spk_l as u32,
                             prevout_value: pv_val,
+                            flags: input_flags,
                         });
                     }
 
                     ecdsa_index_base += tx.inputs.len();
 
                     let tx_id = tx_ids[i];
-                    apply_transaction_to_overlay_no_undo(&mut overlay, tx, tx_id, height);
+                    apply_transaction_to_overlay_no_undo_cached(
+                        &mut overlay,
+                        tx,
+                        tx_id,
+                        height,
+                        ibd_output_cache_ref,
+                    );
                 }
 
                 if let Some(r) = early_return.take() {
@@ -1210,6 +1391,12 @@ pub(crate) fn connect_block_inner<'a>(
                     let schnorr_collector: Option<
                         Arc<crate::bip348::SchnorrSignatureCollector>,
                     > = None;
+                    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                    let ecdsa_collector = if use_ecdsa_batch_collect() {
+                        Some(Arc::clone(&block_ecdsa_collector))
+                    } else {
+                        None
+                    };
 
                     // Small-block fast path: skip ScriptCheckQueue overhead for blocks with <32 inputs.
                     const SMALL_BLOCK_THRESHOLD: usize = 32;
@@ -1222,7 +1409,15 @@ pub(crate) fn connect_block_inner<'a>(
                     // STILL want the inline P2PK / P2PKH fast paths the rayon closure has, so
                     // we share the same closure body across both paths via `process_check`
                     // and dispatch on a runtime flag.
-                    let use_serial_path = ibd_mode || total_inputs < SMALL_BLOCK_THRESHOLD;
+                    // IBD default: serial per block (N-block parallelism). Opt-in
+                    // BLVM_ECDSA_COLLECT_THREADS≥2 uses a dedicated pool for within-block
+                    // collect (host binder @400k; not global SCRIPT_THREADS).
+                    #[cfg(feature = "production")]
+                    let ecdsa_collect_n = crate::ecdsa_timers::collect_threads();
+                    #[cfg(not(feature = "production"))]
+                    let ecdsa_collect_n = 0usize;
+                    let use_serial_path = (ibd_mode && ecdsa_collect_n < 2)
+                        || total_inputs < SMALL_BLOCK_THRESHOLD;
                     let check_results = {
                         let rayon_session = Arc::new(BlockSessionContext {
                             block: Arc::clone(&block_arc),
@@ -1235,6 +1430,8 @@ pub(crate) fn connect_block_inner<'a>(
                             ecdsa_sub_counters: Arc::clone(&ecdsa_sub_counters),
                             #[cfg(feature = "production")]
                             schnorr_collector,
+                            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                            ecdsa_collector,
                             height,
                             median_time_past,
                             network,
@@ -1284,7 +1481,16 @@ pub(crate) fn connect_block_inner<'a>(
                                 )
                                 .is_some()
                             {
-                                return crate::script::verify_p2pk_inline(
+                                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                                let collect = session.ecdsa_collector.as_ref().map(|col| {
+                                    (
+                                        col.as_ref(),
+                                        ctx.ecdsa_index_base + c.input_idx,
+                                    )
+                                });
+                                #[cfg(all(feature = "production", feature = "profile"))]
+                                let _arm_t0 = std::time::Instant::now();
+                                let out = crate::script::verify_p2pk_inline(
                                     tx.inputs[c.input_idx].script_sig.as_slice(),
                                     script_pubkey,
                                     flags,
@@ -1292,6 +1498,11 @@ pub(crate) fn connect_block_inner<'a>(
                                     c.input_idx,
                                     height,
                                     network,
+                                    #[cfg(all(
+                                        feature = "production",
+                                        feature = "blvm-secp256k1"
+                                    ))]
+                                    collect,
                                 )
                                 .map(|v| (c.tx_ctx_idx, v))
                                 .map_err(|e| {
@@ -1303,6 +1514,11 @@ pub(crate) fn connect_block_inner<'a>(
                                         .into(),
                                     )
                                 });
+                                #[cfg(all(feature = "production", feature = "profile"))]
+                                crate::script_profile::note_arm_p2pk(
+                                    _arm_t0.elapsed().as_nanos() as u64,
+                                );
+                                return out;
                             }
 
                             // P2PKH fast path: OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG
@@ -1320,7 +1536,34 @@ pub(crate) fn connect_block_inner<'a>(
                                 )
                                 .is_some()
                             {
-                                return crate::script::verify_p2pkh_inline(
+                                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                                let collect = session.ecdsa_collector.as_ref().map(|col| {
+                                    (
+                                        col.as_ref(),
+                                        ctx.ecdsa_index_base + c.input_idx,
+                                    )
+                                });
+                                #[cfg(feature = "production")]
+                                let pre_idx = ctx.ecdsa_index_base + c.input_idx;
+                                #[cfg(feature = "production")]
+                                let pre_sighash = session
+                                    .precomputed_sighashes
+                                    .get(pre_idx)
+                                    .copied()
+                                    .flatten();
+                                #[cfg(feature = "production")]
+                                let pre_hash160 = session
+                                    .precomputed_p2pkh_hashes
+                                    .get(pre_idx)
+                                    .copied()
+                                    .flatten();
+                                #[cfg(not(feature = "production"))]
+                                let pre_sighash = None;
+                                #[cfg(not(feature = "production"))]
+                                let pre_hash160 = None;
+                                #[cfg(all(feature = "production", feature = "profile"))]
+                                let _arm_t0 = std::time::Instant::now();
+                                let out = crate::script::verify_p2pkh_inline(
                                     tx.inputs[c.input_idx].script_sig.as_slice(),
                                     script_pubkey,
                                     flags,
@@ -1328,7 +1571,10 @@ pub(crate) fn connect_block_inner<'a>(
                                     c.input_idx,
                                     height,
                                     network,
-                                    None,
+                                    pre_sighash,
+                                    pre_hash160,
+                                    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                                    collect,
                                 )
                                 .map(|v| (c.tx_ctx_idx, v))
                                 .map_err(|e| {
@@ -1340,9 +1586,306 @@ pub(crate) fn connect_block_inner<'a>(
                                         .into(),
                                     )
                                 });
+                                #[cfg(all(feature = "production", feature = "profile"))]
+                                crate::script_profile::note_arm_p2pkh(
+                                    _arm_t0.elapsed().as_nanos() as u64,
+                                );
+                                return out;
+                            }
+
+                            // Nested P2WPKH-in-P2SH IBD arm (default-on; BLVM_P2WPKH_IBD_ARM=0 disables).
+                            // Must require 22-byte P2WPKH redeem: P2WSH-in-P2SH also has wit.len()==2.
+                            if !std::env::var_os("BLVM_P2WPKH_IBD_ARM").is_some_and(|v| v == "0")
+                                && session.activation.is_fork_active(ForkId::SegWit, height)
+                                && (flags & 0x01) != 0
+                                && spk_len == 23
+                                && script_pubkey[0] == OP_HASH160
+                                && script_pubkey[1] == PUSH_20_BYTES
+                                && script_pubkey[22] == OP_EQUAL
+                            {
+                                let ss = tx.inputs[c.input_idx].script_sig.as_slice();
+                                // push(22) ‖ OP_0 ‖ PUSH_20 ‖ <20-byte program>
+                                let nested_p2wpkh_redeem = ss.len() == 23
+                                    && ss[0] == 22
+                                    && ss[1] == OP_0
+                                    && ss[2] == PUSH_20_BYTES;
+                                if nested_p2wpkh_redeem {
+                                    if let Some(witness) = session
+                                        .witness_buffer
+                                        .get(ctx.tx_index)
+                                        .and_then(|w| w.get(c.input_idx))
+                                        .filter(|w| !is_witness_empty(w))
+                                        .filter(|w| w.len() == 2)
+                                    {
+                                        #[cfg(all(
+                                            feature = "production",
+                                            feature = "blvm-secp256k1"
+                                        ))]
+                                        let collect = session.ecdsa_collector.as_ref().map(|col| {
+                                            (
+                                                col.as_ref(),
+                                                ctx.ecdsa_index_base + c.input_idx,
+                                            )
+                                        });
+                                        let (pv_base, pv_count) = ctx.prevout_values_range;
+                                        let prevout_slice =
+                                            &session.prevout_values_buffer[pv_base..][..pv_count];
+                                        let prevout_value = prevout_slice
+                                            .get(c.input_idx)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        #[cfg(all(feature = "production", feature = "profile"))]
+                                        let _arm_t0 = std::time::Instant::now();
+                                        let out = crate::script::verify_p2wpkh_in_p2sh_inline(
+                                            ss,
+                                            witness,
+                                            script_pubkey,
+                                            flags,
+                                            tx,
+                                            c.input_idx,
+                                            prevout_value,
+                                            height,
+                                            network,
+                                            ctx.bip143.as_ref(),
+                                            #[cfg(all(
+                                                feature = "production",
+                                                feature = "blvm-secp256k1"
+                                            ))]
+                                            collect,
+                                        )
+                                        .map(|v| (c.tx_ctx_idx, v))
+                                        .map_err(|e| {
+                                            ConsensusError::BlockValidation(
+                                                format!(
+                                                    "P2WPKH-in-P2SH tx {} input {}: {}",
+                                                    ctx.tx_index, c.input_idx, e
+                                                )
+                                                .into(),
+                                            )
+                                        });
+                                        #[cfg(all(feature = "production", feature = "profile"))]
+                                        crate::script_profile::note_arm_p2wpkh(
+                                            _arm_t0.elapsed().as_nanos() as u64,
+                                        );
+                                        return out;
+                                    }
+                                }
+                            }
+
+                            // Native P2WPKH IBD arm (default-on; BLVM_P2WPKH_IBD_ARM=0 disables).
+                            if !std::env::var_os("BLVM_P2WPKH_IBD_ARM").is_some_and(|v| v == "0")
+                                && session.activation.is_fork_active(ForkId::SegWit, height)
+                                && spk_len == 22
+                                && script_pubkey[0] == OP_0
+                                && script_pubkey[1] == PUSH_20_BYTES
+                                && tx.inputs[c.input_idx].script_sig.is_empty()
+                            {
+                                if let Some(witness) = session
+                                    .witness_buffer
+                                    .get(ctx.tx_index)
+                                    .and_then(|w| w.get(c.input_idx))
+                                    .filter(|w| !is_witness_empty(w))
+                                    .filter(|w| w.len() == 2)
+                                {
+                                    #[cfg(all(
+                                        feature = "production",
+                                        feature = "blvm-secp256k1"
+                                    ))]
+                                    let collect = session.ecdsa_collector.as_ref().map(|col| {
+                                        (
+                                            col.as_ref(),
+                                            ctx.ecdsa_index_base + c.input_idx,
+                                        )
+                                    });
+                                    // Never use legacy precomputed_sighashes for BIP143 P2WPKH.
+                                    let pre_sighash = None;
+                                    let (pv_base, pv_count) = ctx.prevout_values_range;
+                                    let prevout_slice =
+                                        &session.prevout_values_buffer[pv_base..][..pv_count];
+                                    let prevout_value = prevout_slice
+                                        .get(c.input_idx)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    #[cfg(all(feature = "production", feature = "profile"))]
+                                    let _arm_t0 = std::time::Instant::now();
+                                    let out = crate::script::verify_p2wpkh_inline(
+                                        witness,
+                                        script_pubkey,
+                                        flags,
+                                        tx,
+                                        c.input_idx,
+                                        prevout_value,
+                                        height,
+                                        network,
+                                        ctx.bip143.as_ref(),
+                                        pre_sighash,
+                                        #[cfg(all(
+                                            feature = "production",
+                                            feature = "blvm-secp256k1"
+                                        ))]
+                                        collect,
+                                    )
+                                    .map(|v| (c.tx_ctx_idx, v))
+                                    .map_err(|e| {
+                                        ConsensusError::BlockValidation(
+                                            format!(
+                                                "P2WPKH tx {} input {}: {}",
+                                                ctx.tx_index, c.input_idx, e
+                                            )
+                                            .into(),
+                                        )
+                                    });
+                                    #[cfg(all(feature = "production", feature = "profile"))]
+                                    crate::script_profile::note_arm_p2wpkh(
+                                        _arm_t0.elapsed().as_nanos() as u64,
+                                    );
+                                    return out;
+                                }
+                            }
+
+                            // Nested P2WSH-in-P2SH — ATTR binder (was counted as fallback).
+                            if session.activation.is_fork_active(ForkId::SegWit, height)
+                                && (flags & 0x01) != 0
+                                && spk_len == 23
+                                && script_pubkey[0] == OP_HASH160
+                                && script_pubkey[1] == PUSH_20_BYTES
+                                && script_pubkey[22] == OP_EQUAL
+                            {
+                                let ss = tx.inputs[c.input_idx].script_sig.as_slice();
+                                // push(34) ‖ OP_0 ‖ PUSH_32 ‖ <32-byte program>
+                                let nested_p2wsh = ss.len() == 35
+                                    && ss[0] == 34
+                                    && ss[1] == OP_0
+                                    && ss[2] == PUSH_32_BYTES;
+                                if nested_p2wsh {
+                                    if let Some(witness) = session
+                                        .witness_buffer
+                                        .get(ctx.tx_index)
+                                        .and_then(|w| w.get(c.input_idx))
+                                        .filter(|w| !is_witness_empty(w))
+                                    {
+                                        let pv = session.prevout_values_buffer.as_slice();
+                                        let spi = session.script_pubkey_indices_buffer.as_slice();
+                                        let (pv_base, pv_count) = ctx.prevout_values_range;
+                                        let prevout_slice = &pv[pv_base..][..pv_count];
+                                        let (spi_base, spi_count) = ctx.script_pubkey_indices_range;
+                                        let refs: Vec<&[u8]> = (0..spi_count)
+                                            .map(|j| {
+                                                let (start, len) = spi[spi_base + j];
+                                                if start + len <= buffer.len() {
+                                                    &buffer[start..start + len]
+                                                } else {
+                                                    &[]
+                                                }
+                                            })
+                                            .collect();
+                                        #[cfg(all(feature = "production", feature = "profile"))]
+                                        let _arm_t0 = std::time::Instant::now();
+                                        if let Some(result) =
+                                            crate::script::try_verify_p2wsh_in_p2sh_fast_path(
+                                                &tx.inputs[c.input_idx].script_sig,
+                                                script_pubkey,
+                                                witness,
+                                                flags,
+                                                tx,
+                                                c.input_idx,
+                                                prevout_slice,
+                                                &refs,
+                                                Some(height),
+                                                session.median_time_past,
+                                                network,
+                                                None,
+                                                ctx.bip143.as_ref(),
+                                                #[cfg(feature = "production")]
+                                                ctx.sighash_midstate_cache.as_ref(),
+                                                #[cfg(all(
+                                                    feature = "production",
+                                                    feature = "blvm-secp256k1"
+                                                ))]
+                                                session.ecdsa_collector.as_deref(),
+                                            )
+                                        {
+                                            #[cfg(all(
+                                                feature = "production",
+                                                feature = "profile"
+                                            ))]
+                                            crate::script_profile::note_arm_p2wsh(
+                                                _arm_t0.elapsed().as_nanos() as u64,
+                                            );
+                                            return result
+                                                .map(|v| (c.tx_ctx_idx, v))
+                                                .map_err(|e| {
+                                                    ConsensusError::BlockValidation(
+                                                        format!(
+                                                            "P2WSH-in-P2SH tx {} input {}: {}",
+                                                            ctx.tx_index, c.input_idx, e
+                                                        )
+                                                        .into(),
+                                                    )
+                                                });
+                                        }
+                                    }
+                                }
+                            }
+
+                            // P2SH-multisig: defer ECDSA trials to SoA/GPU when collector present.
+                            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                            if spk_len == 23
+                                && script_pubkey[0] == OP_HASH160
+                                && script_pubkey[1] == PUSH_20_BYTES
+                                && script_pubkey[22] == OP_EQUAL
+                            {
+                                let pv = session.prevout_values_buffer.as_slice();
+                                let spi = session.script_pubkey_indices_buffer.as_slice();
+                                let (pv_base, pv_count) = ctx.prevout_values_range;
+                                let prevout_slice = &pv[pv_base..][..pv_count];
+                                let (spi_base, spi_count) = ctx.script_pubkey_indices_range;
+                                let refs: Vec<&[u8]> = (0..spi_count)
+                                    .map(|j| {
+                                        let (start, len) = spi[spi_base + j];
+                                        if start + len <= buffer.len() {
+                                            &buffer[start..start + len]
+                                        } else {
+                                            &[]
+                                        }
+                                    })
+                                    .collect();
+                                #[cfg(all(feature = "production", feature = "profile"))]
+                                let _arm_t0 = std::time::Instant::now();
+                                if let Some(result) = crate::script::try_verify_p2sh_multisig_ibd(
+                                    &tx.inputs[c.input_idx].script_sig,
+                                    script_pubkey,
+                                    flags,
+                                    tx,
+                                    c.input_idx,
+                                    prevout_slice,
+                                    &refs,
+                                    Some(height),
+                                    network,
+                                    ctx.sighash_midstate_cache.as_ref(),
+                                    session.ecdsa_collector.as_deref(),
+                                ) {
+                                    #[cfg(all(feature = "production", feature = "profile"))]
+                                    crate::script_profile::note_arm_p2sh_multisig(
+                                        _arm_t0.elapsed().as_nanos() as u64,
+                                    );
+                                    return result
+                                        .map(|v| (c.tx_ctx_idx, v))
+                                        .map_err(|e| {
+                                            ConsensusError::BlockValidation(
+                                                format!(
+                                                    "P2SH-multisig tx {} input {}: {}",
+                                                    ctx.tx_index, c.input_idx, e
+                                                )
+                                                .into(),
+                                            )
+                                        });
+                                }
                             }
 
                             // Fallback: full interpreter path
+                            #[cfg(all(feature = "production", feature = "profile"))]
+                            let _arm_t0 = std::time::Instant::now();
                             let pv = session.prevout_values_buffer.as_slice();
                             let spi = session.script_pubkey_indices_buffer.as_slice();
                             let (pv_base, pv_count) = ctx.prevout_values_range;
@@ -1369,6 +1912,37 @@ pub(crate) fn connect_block_inner<'a>(
                                 Some(script_pubkey),
                                 Some(prevout_slice),
                             )?;
+                            #[cfg(all(feature = "production", feature = "profile"))]
+                            {
+                                let ss = tx.inputs[c.input_idx].script_sig.as_slice();
+                                let kind = if spk_len == 23
+                                    && script_pubkey[0] == OP_HASH160
+                                    && script_pubkey[1] == PUSH_20_BYTES
+                                    && script_pubkey[22] == OP_EQUAL
+                                {
+                                    if ss.len() == 35
+                                        && ss[0] == 34
+                                        && ss[1] == OP_0
+                                        && ss[2] == PUSH_32_BYTES
+                                    {
+                                        crate::script_profile::FallbackShape::NestedP2wsh
+                                    } else {
+                                        crate::script_profile::FallbackShape::P2shOther
+                                    }
+                                } else if (spk_len == 22 || spk_len == 34)
+                                    && (script_pubkey[0] == OP_0 || script_pubkey[0] == OP_1)
+                                    && (script_pubkey[1] == PUSH_20_BYTES
+                                        || script_pubkey[1] == PUSH_32_BYTES)
+                                {
+                                    crate::script_profile::FallbackShape::NativeWit
+                                } else {
+                                    crate::script_profile::FallbackShape::Other
+                                };
+                                crate::script_profile::note_fallback_shape(
+                                    _arm_t0.elapsed().as_nanos() as u64,
+                                    kind,
+                                );
+                            }
                             Ok((c.tx_ctx_idx, valid))
                         };
 
@@ -1382,6 +1956,8 @@ pub(crate) fn connect_block_inner<'a>(
                                 // `process_check` builds `refs: Vec<&[u8]>` per call; at h=600k+
                                 // with 8k inputs/block (P2SH/SegWit fallback), that's 8k Vec allocs/block.
                                 // With cached_ctx_idx we build refs once per unique tx in the batch.
+                                #[cfg(feature = "production")]
+                                let collect_t0 = std::time::Instant::now();
                                 let session = rayon_session.as_ref();
                                 let buffer = session.script_pubkey_buffer.as_slice();
                                 let spi = session.script_pubkey_indices_buffer.as_slice();
@@ -1428,6 +2004,19 @@ pub(crate) fn connect_block_inner<'a>(
                                         )
                                         .is_some()
                                     {
+                                        #[cfg(all(
+                                            feature = "production",
+                                            feature = "blvm-secp256k1"
+                                        ))]
+                                        let collect =
+                                            session.ecdsa_collector.as_ref().map(|col| {
+                                                (
+                                                    col.as_ref(),
+                                                    ctx.ecdsa_index_base + c.input_idx,
+                                                )
+                                            });
+                                        #[cfg(all(feature = "production", feature = "profile"))]
+                                        let _arm_t0 = std::time::Instant::now();
                                         serial_results.push(
                                             crate::script::verify_p2pk_inline(
                                                 tx.inputs[c.input_idx].script_sig.as_slice(),
@@ -1437,6 +2026,11 @@ pub(crate) fn connect_block_inner<'a>(
                                                 c.input_idx,
                                                 block_height_s,
                                                 network_s,
+                                                #[cfg(all(
+                                                    feature = "production",
+                                                    feature = "blvm-secp256k1"
+                                                ))]
+                                                collect,
                                             )
                                             .map(|v| (c.tx_ctx_idx, v))
                                             .map_err(
@@ -1451,34 +2045,76 @@ pub(crate) fn connect_block_inner<'a>(
                                                 },
                                             ),
                                         );
+                                        #[cfg(all(feature = "production", feature = "profile"))]
+                                        crate::script_profile::note_arm_p2pk(
+                                            _arm_t0.elapsed().as_nanos() as u64,
+                                        );
                                         continue;
                                     }
-                                    // P2PKH fast path
+                                    // P2PKH fast path — parse once (avoid double parse in inline).
                                     if spk_len == 25
                                         && script_pubkey[0] == OP_DUP
                                         && script_pubkey[1] == OP_HASH160
                                         && script_pubkey[2] == PUSH_20_BYTES
                                         && script_pubkey[23] == OP_EQUALVERIFY
                                         && last_byte == OP_CHECKSIG
-                                        && crate::script::parse_p2pkh_script_sig(
-                                            tx.inputs[c.input_idx].script_sig.as_slice(),
-                                        )
-                                        .is_some()
                                     {
-                                        serial_results.push(
-                                            crate::script::verify_p2pkh_inline(
+                                        if let Some((sig_b, pk_b)) =
+                                            crate::script::parse_p2pkh_script_sig(
                                                 tx.inputs[c.input_idx].script_sig.as_slice(),
-                                                script_pubkey,
-                                                flags_s,
-                                                tx,
-                                                c.input_idx,
-                                                block_height_s,
-                                                network_s,
-                                                None,
                                             )
-                                            .map(|v| (c.tx_ctx_idx, v))
-                                            .map_err(
-                                                |e| {
+                                        {
+                                            #[cfg(all(
+                                                feature = "production",
+                                                feature = "blvm-secp256k1"
+                                            ))]
+                                            let collect =
+                                                session.ecdsa_collector.as_ref().map(|col| {
+                                                    (
+                                                        col.as_ref(),
+                                                        ctx.ecdsa_index_base + c.input_idx,
+                                                    )
+                                                });
+                                            #[cfg(feature = "production")]
+                                            let pre_idx = ctx.ecdsa_index_base + c.input_idx;
+                                            #[cfg(feature = "production")]
+                                            let pre_sighash = session
+                                                .precomputed_sighashes
+                                                .get(pre_idx)
+                                                .copied()
+                                                .flatten();
+                                            #[cfg(feature = "production")]
+                                            let pre_hash160 = session
+                                                .precomputed_p2pkh_hashes
+                                                .get(pre_idx)
+                                                .copied()
+                                                .flatten();
+                                            #[cfg(not(feature = "production"))]
+                                            let pre_sighash = None;
+                                            #[cfg(not(feature = "production"))]
+                                            let pre_hash160 = None;
+                                            #[cfg(all(feature = "production", feature = "profile"))]
+                                            let _arm_t0 = std::time::Instant::now();
+                                            serial_results.push(
+                                                crate::script::verify_p2pkh_inline_parsed(
+                                                    sig_b,
+                                                    pk_b,
+                                                    script_pubkey,
+                                                    flags_s,
+                                                    tx,
+                                                    c.input_idx,
+                                                    block_height_s,
+                                                    network_s,
+                                                    pre_sighash,
+                                                    pre_hash160,
+                                                    #[cfg(all(
+                                                        feature = "production",
+                                                        feature = "blvm-secp256k1"
+                                                    ))]
+                                                    collect,
+                                                )
+                                                .map(|v| (c.tx_ctx_idx, v))
+                                                .map_err(|e| {
                                                     ConsensusError::BlockValidation(
                                                         format!(
                                                             "P2PKH tx {} input {}: {}",
@@ -1486,10 +2122,322 @@ pub(crate) fn connect_block_inner<'a>(
                                                         )
                                                         .into(),
                                                     )
+                                                }),
+                                            );
+                                            #[cfg(all(feature = "production", feature = "profile"))]
+                                            crate::script_profile::note_arm_p2pkh(
+                                                _arm_t0.elapsed().as_nanos() as u64,
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    // Nested P2WPKH-in-P2SH IBD arm (default-on; BLVM_P2WPKH_IBD_ARM=0 disables).
+                                    // Require 22-byte P2WPKH redeem (P2WSH-in-P2SH also has wit.len()==2).
+                                    if !std::env::var_os("BLVM_P2WPKH_IBD_ARM").is_some_and(|v| v == "0")
+                                        && session.activation.is_fork_active(ForkId::SegWit, block_height_s)
+                                        && (flags_s & 0x01) != 0
+                                        && spk_len == 23
+                                        && script_pubkey[0] == OP_HASH160
+                                        && script_pubkey[1] == PUSH_20_BYTES
+                                        && script_pubkey[22] == OP_EQUAL
+                                    {
+                                        let ss = tx.inputs[c.input_idx].script_sig.as_slice();
+                                        let nested_p2wpkh_redeem = ss.len() == 23
+                                            && ss[0] == 22
+                                            && ss[1] == OP_0
+                                            && ss[2] == PUSH_20_BYTES;
+                                        if nested_p2wpkh_redeem {
+                                            if let Some(witness) = session
+                                                .witness_buffer
+                                                .get(ctx.tx_index)
+                                                .and_then(|w| w.get(c.input_idx))
+                                                .filter(|w| !is_witness_empty(w))
+                                                .filter(|w| w.len() == 2)
+                                            {
+                                                #[cfg(all(
+                                                    feature = "production",
+                                                    feature = "blvm-secp256k1"
+                                                ))]
+                                                let collect =
+                                                    session.ecdsa_collector.as_ref().map(|col| {
+                                                        (
+                                                            col.as_ref(),
+                                                            ctx.ecdsa_index_base + c.input_idx,
+                                                        )
+                                                    });
+                                                let (pv_base, pv_count) = ctx.prevout_values_range;
+                                                let prevout_slice = &pv[pv_base..][..pv_count];
+                                                let prevout_value = prevout_slice
+                                                    .get(c.input_idx)
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                #[cfg(all(
+                                                    feature = "production",
+                                                    feature = "profile"
+                                                ))]
+                                                let _arm_t0 = std::time::Instant::now();
+                                                serial_results.push(
+                                                    crate::script::verify_p2wpkh_in_p2sh_inline(
+                                                        ss,
+                                                        witness,
+                                                        script_pubkey,
+                                                        flags_s,
+                                                        tx,
+                                                        c.input_idx,
+                                                        prevout_value,
+                                                        block_height_s,
+                                                        network_s,
+                                                        ctx.bip143.as_ref(),
+                                                        #[cfg(all(
+                                                            feature = "production",
+                                                            feature = "blvm-secp256k1"
+                                                        ))]
+                                                        collect,
+                                                    )
+                                                    .map(|v| (c.tx_ctx_idx, v))
+                                                    .map_err(|e| {
+                                                        ConsensusError::BlockValidation(
+                                                            format!(
+                                                                "P2WPKH-in-P2SH tx {} input {}: {}",
+                                                                ctx.tx_index, c.input_idx, e
+                                                            )
+                                                            .into(),
+                                                        )
+                                                    }),
+                                                );
+                                                #[cfg(all(
+                                                    feature = "production",
+                                                    feature = "profile"
+                                                ))]
+                                                crate::script_profile::note_arm_p2wpkh(
+                                                    _arm_t0.elapsed().as_nanos() as u64,
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // Native P2WPKH IBD arm (default-on; BLVM_P2WPKH_IBD_ARM=0 disables).
+                                    if !std::env::var_os("BLVM_P2WPKH_IBD_ARM").is_some_and(|v| v == "0")
+                                        && session.activation.is_fork_active(ForkId::SegWit, block_height_s)
+                                        && spk_len == 22
+                                        && script_pubkey[0] == OP_0
+                                        && script_pubkey[1] == PUSH_20_BYTES
+                                        && tx.inputs[c.input_idx].script_sig.is_empty()
+                                    {
+                                        if let Some(witness) = session
+                                            .witness_buffer
+                                            .get(ctx.tx_index)
+                                            .and_then(|w| w.get(c.input_idx))
+                                            .filter(|w| !is_witness_empty(w))
+                                            .filter(|w| w.len() == 2)
+                                        {
+                                            #[cfg(all(
+                                                feature = "production",
+                                                feature = "blvm-secp256k1"
+                                            ))]
+                                            let collect =
+                                                session.ecdsa_collector.as_ref().map(|col| {
+                                                    (
+                                                        col.as_ref(),
+                                                        ctx.ecdsa_index_base + c.input_idx,
+                                                    )
+                                                });
+                                            // Never use legacy precomputed_sighashes for BIP143.
+                                            let pre_sighash = None;
+                                            let (pv_base, pv_count) = ctx.prevout_values_range;
+                                            let prevout_slice = &pv[pv_base..][..pv_count];
+                                            let prevout_value = prevout_slice
+                                                .get(c.input_idx)
+                                                .copied()
+                                                .unwrap_or(0);
+                                            #[cfg(all(
+                                                feature = "production",
+                                                feature = "profile"
+                                            ))]
+                                            let _arm_t0 = std::time::Instant::now();
+                                            serial_results.push(
+                                                crate::script::verify_p2wpkh_inline(
+                                                    witness,
+                                                    script_pubkey,
+                                                    flags_s,
+                                                    tx,
+                                                    c.input_idx,
+                                                    prevout_value,
+                                                    block_height_s,
+                                                    network_s,
+                                                    ctx.bip143.as_ref(),
+                                                    pre_sighash,
+                                                    #[cfg(all(
+                                                        feature = "production",
+                                                        feature = "blvm-secp256k1"
+                                                    ))]
+                                                    collect,
+                                                )
+                                                .map(|v| (c.tx_ctx_idx, v))
+                                                .map_err(|e| {
+                                                    ConsensusError::BlockValidation(
+                                                        format!(
+                                                            "P2WPKH tx {} input {}: {}",
+                                                            ctx.tx_index, c.input_idx, e
+                                                        )
+                                                        .into(),
+                                                    )
+                                                }),
+                                            );
+                                            #[cfg(all(
+                                                feature = "production",
+                                                feature = "profile"
+                                            ))]
+                                            crate::script_profile::note_arm_p2wpkh(
+                                                _arm_t0.elapsed().as_nanos() as u64,
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    // Nested P2WSH-in-P2SH — ATTR binder (was counted as fallback).
+                                    if session.activation.is_fork_active(ForkId::SegWit, block_height_s)
+                                        && (flags_s & 0x01) != 0
+                                        && spk_len == 23
+                                        && script_pubkey[0] == OP_HASH160
+                                        && script_pubkey[1] == PUSH_20_BYTES
+                                        && script_pubkey[22] == OP_EQUAL
+                                    {
+                                        let ss = tx.inputs[c.input_idx].script_sig.as_slice();
+                                        // push(34) ‖ OP_0 ‖ PUSH_32 ‖ <32-byte program>
+                                        let nested_p2wsh = ss.len() == 35
+                                            && ss[0] == 34
+                                            && ss[1] == OP_0
+                                            && ss[2] == PUSH_32_BYTES;
+                                        if nested_p2wsh {
+                                            if let Some(witness) = session
+                                                .witness_buffer
+                                                .get(ctx.tx_index)
+                                                .and_then(|w| w.get(c.input_idx))
+                                                .filter(|w| !is_witness_empty(w))
+                                            {
+                                                let (pv_base, pv_count) = ctx.prevout_values_range;
+                                                let prevout_slice = &pv[pv_base..][..pv_count];
+                                                if c.tx_ctx_idx != cached_ctx_for_refs {
+                                                    refs_buf.clear();
+                                                    let (spi_base, spi_count) =
+                                                        ctx.script_pubkey_indices_range;
+                                                    for j in 0..spi_count {
+                                                        let (start, len) = spi[spi_base + j];
+                                                        refs_buf.push(
+                                                            if start + len <= buffer.len() {
+                                                                &buffer[start..start + len]
+                                                            } else {
+                                                                &[]
+                                                            },
+                                                        );
+                                                    }
+                                                    cached_ctx_for_refs = c.tx_ctx_idx;
+                                                }
+                                                #[cfg(all(
+                                                    feature = "production",
+                                                    feature = "profile"
+                                                ))]
+                                                let _arm_t0 = std::time::Instant::now();
+                                                if let Some(result) = crate::script::try_verify_p2wsh_in_p2sh_fast_path(
+                                                    &tx.inputs[c.input_idx].script_sig,
+                                                    script_pubkey,
+                                                    witness,
+                                                    flags_s,
+                                                    tx,
+                                                    c.input_idx,
+                                                    prevout_slice,
+                                                    &refs_buf,
+                                                    Some(block_height_s),
+                                                    session.median_time_past,
+                                                    network_s,
+                                                    None,
+                                                    ctx.bip143.as_ref(),
+                                                    #[cfg(feature = "production")]
+                                                    ctx.sighash_midstate_cache.as_ref(),
+                                                    #[cfg(all(
+                                                        feature = "production",
+                                                        feature = "blvm-secp256k1"
+                                                    ))]
+                                                    session.ecdsa_collector.as_deref(),
+                                                ) {
+                                                    #[cfg(all(
+                                                        feature = "production",
+                                                        feature = "profile"
+                                                    ))]
+                                                    crate::script_profile::note_arm_p2wsh(
+                                                        _arm_t0.elapsed().as_nanos() as u64,
+                                                    );
+                                                    serial_results.push(
+                                                        result.map(|v| (c.tx_ctx_idx, v)).map_err(
+                                                            |e| {
+                                                                ConsensusError::BlockValidation(
+                                                                    format!(
+                                                                        "P2WSH-in-P2SH tx {} input {}: {}",
+                                                                        ctx.tx_index,
+                                                                        c.input_idx,
+                                                                        e
+                                                                    )
+                                                                    .into(),
+                                                                )
+                                                            },
+                                                        ),
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // P2SH-multisig deferral (SoA/GPU) before interpreter fallback.
+                                    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                                    if spk_len == 23
+                                        && script_pubkey[0] == OP_HASH160
+                                        && script_pubkey[1] == PUSH_20_BYTES
+                                        && script_pubkey[22] == OP_EQUAL
+                                    {
+                                        let (pv_base, pv_count) = ctx.prevout_values_range;
+                                        let prevout_slice = &pv[pv_base..][..pv_count];
+                                        if c.tx_ctx_idx != cached_ctx_for_refs {
+                                            refs_buf.clear();
+                                            let (spi_base, spi_count) =
+                                                ctx.script_pubkey_indices_range;
+                                            for j in 0..spi_count {
+                                                let (start, len) = spi[spi_base + j];
+                                                refs_buf.push(if start + len <= buffer.len() {
+                                                    &buffer[start..start + len]
+                                                } else {
+                                                    &[]
+                                                });
+                                            }
+                                            cached_ctx_for_refs = c.tx_ctx_idx;
+                                        }
+                                        if let Some(result) =
+                                            crate::script::try_verify_p2sh_multisig_ibd(
+                                                &tx.inputs[c.input_idx].script_sig,
+                                                script_pubkey,
+                                                flags_s,
+                                                tx,
+                                                c.input_idx,
+                                                prevout_slice,
+                                                &refs_buf,
+                                                Some(block_height_s),
+                                                network_s,
+                                                ctx.sighash_midstate_cache.as_ref(),
+                                                session.ecdsa_collector.as_deref(),
+                                            )
+                                        {
+                                            serial_results.push(result.map(|v| (c.tx_ctx_idx, v)).map_err(
+                                                |e| {
+                                                    ConsensusError::BlockValidation(
+                                                        format!(
+                                                            "P2SH-multisig tx {} input {}: {}",
+                                                            ctx.tx_index, c.input_idx, e
+                                                        )
+                                                        .into(),
+                                                    )
                                                 },
-                                            ),
-                                        );
-                                        continue;
+                                            ));
+                                            continue;
+                                        }
                                     }
                                     // Fallback: full interpreter — reuse refs_buf across same-tx checks.
                                     let (pv_base, pv_count) = ctx.prevout_values_range;
@@ -1507,6 +2455,8 @@ pub(crate) fn connect_block_inner<'a>(
                                         }
                                         cached_ctx_for_refs = c.tx_ctx_idx;
                                     }
+                                    #[cfg(all(feature = "production", feature = "profile"))]
+                                    let _arm_t0 = std::time::Instant::now();
                                     let valid =
                                         crate::checkqueue::ScriptCheckQueue::run_check_with_refs(
                                             c,
@@ -1519,9 +2469,82 @@ pub(crate) fn connect_block_inner<'a>(
                                             Some(script_pubkey),
                                             Some(prevout_slice),
                                         );
+                                    #[cfg(all(feature = "production", feature = "profile"))]
+                                    {
+                                        let ss = tx.inputs[c.input_idx].script_sig.as_slice();
+                                        let kind = if spk_len == 23
+                                            && script_pubkey[0] == OP_HASH160
+                                            && script_pubkey[1] == PUSH_20_BYTES
+                                            && script_pubkey[22] == OP_EQUAL
+                                        {
+                                            if ss.len() == 35
+                                                && ss[0] == 34
+                                                && ss[1] == OP_0
+                                                && ss[2] == PUSH_32_BYTES
+                                            {
+                                                crate::script_profile::FallbackShape::NestedP2wsh
+                                            } else {
+                                                crate::script_profile::FallbackShape::P2shOther
+                                            }
+                                        } else if (spk_len == 22 || spk_len == 34)
+                                            && (script_pubkey[0] == OP_0
+                                                || script_pubkey[0] == OP_1)
+                                            && (script_pubkey[1] == PUSH_20_BYTES
+                                                || script_pubkey[1] == PUSH_32_BYTES)
+                                        {
+                                            crate::script_profile::FallbackShape::NativeWit
+                                        } else {
+                                            crate::script_profile::FallbackShape::Other
+                                        };
+                                        crate::script_profile::note_fallback_shape(
+                                            _arm_t0.elapsed().as_nanos() as u64,
+                                            kind,
+                                        );
+                                    }
                                     serial_results.push(valid.map(|v| (c.tx_ctx_idx, v)));
                                 }
+                                #[cfg(feature = "production")]
+                                crate::ecdsa_timers::note_collect_ns(
+                                    collect_t0.elapsed().as_nanos() as u64,
+                                );
                                 serial_results
+                            } else if ibd_mode {
+                                // Width-limited split: COLLECT_THREADS chunks on a shared
+                                // nproc-sized pool (not unbounded par_iter — that lets one
+                                // block hog every pool thread).
+                                #[cfg(feature = "production")]
+                                let collect_t0 = std::time::Instant::now();
+                                let width = ecdsa_collect_n.max(2);
+                                let n_checks = block_checks_buf.len();
+                                let chunk = (n_checks + width - 1) / width;
+                                let out = if let Some(pool) = crate::ecdsa_timers::collect_pool()
+                                {
+                                    pool.install(|| {
+                                        (0..width)
+                                            .into_par_iter()
+                                            .map(|i| {
+                                                let start = i * chunk;
+                                                let end = (start + chunk).min(n_checks);
+                                                let mut local =
+                                                    Vec::with_capacity(end.saturating_sub(start));
+                                                for c in &block_checks_buf[start..end] {
+                                                    local.push(process_check(c));
+                                                }
+                                                local
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .into_iter()
+                                            .flatten()
+                                            .collect()
+                                    })
+                                } else {
+                                    block_checks_buf.par_iter().map(&process_check).collect()
+                                };
+                                #[cfg(feature = "production")]
+                                crate::ecdsa_timers::note_collect_ns(
+                                    collect_t0.elapsed().as_nanos() as u64,
+                                );
+                                out
                             } else {
                                 block_checks_buf.par_iter().map(&process_check).collect()
                             };
@@ -1655,7 +2678,7 @@ pub(crate) fn connect_block_inner<'a>(
                     );
                 }
             }
-            // Batch verify Schnorr signatures (ECDSA uses per-sig verification only).
+            // Batch verify Schnorr + (optional) ECDSA collect from P2PKH fast path.
             // Only when blvm-secp256k1 — crates.io secp256k1 has no batch API; workers verify per-sig.
             #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
             {
@@ -1706,6 +2729,67 @@ pub(crate) fn connect_block_inner<'a>(
                         );
                     }
                 }
+
+                // ECDSA P2PKH collect → ecdsa_verify_batch (CPU / optional GPU).
+                // Wave mode: park SoA for orch two-phase; join mid-block inflight first.
+                if use_ecdsa_batch_collect() && !block_ecdsa_collector.is_empty() {
+                    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                    let wave = crate::ecdsa_wave::is_enabled() && ibd_mode;
+                    #[cfg(not(all(feature = "production", feature = "blvm-secp256k1")))]
+                    let wave = false;
+                    if wave {
+                        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                        {
+                            // Finish async mid-block chunks before parking remainder.
+                            match block_ecdsa_collector.join_inflight() {
+                                Err(e) => {
+                                    return invalid_block_result(
+                                        utxo_set,
+                                        tx_ids,
+                                        format!("ECDSA async chunk failed: {e:?}"),
+                                    );
+                                }
+                                Ok(partial) => {
+                                    if partial.iter().any(|(_, v)| !v) {
+                                        return invalid_block_result(
+                                            utxo_set,
+                                            tx_ids,
+                                            "Invalid ECDSA signature in block",
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(soa) = block_ecdsa_collector.take_owned_soa() {
+                                crate::ecdsa_wave::park_pending(soa);
+                            }
+                        }
+                    } else {
+                        match block_ecdsa_collector.verify_batch() {
+                            Err(e) => {
+                                return invalid_block_result(
+                                    utxo_set,
+                                    tx_ids,
+                                    format!("ECDSA batch verification failed: {e:?}"),
+                                );
+                            }
+                            Ok(ecdsa_results) => {
+                                // verify_batch enforces P2PKH rows + deferred CHECKMULTISIG resolve.
+                                // Returned vec may contain false for failed multisig *trials* (oracle).
+                                #[cfg(feature = "profile")]
+                                if !ecdsa_results.is_empty() {
+                                    profile_log!(
+                                        "[BATCH] Block {}: {} ECDSA rows verified (incl. multisig trials)",
+                                        height,
+                                        ecdsa_results.len()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "production")]
+                crate::ecdsa_timers::note_block_done();
+
                 let total_batch_time = batch_start.elapsed();
                 #[cfg(feature = "profile")]
                 {
@@ -1744,9 +2828,33 @@ pub(crate) fn connect_block_inner<'a>(
                         crate::script_profile::get_and_reset_drain_timing();
                     let (ecdsa_cache_hits, ecdsa_cache_misses) =
                         crate::script_profile::get_and_reset_ecdsa_cache_stats();
+                    let (
+                        arm_p2pkh_n,
+                        arm_p2pkh_ns,
+                        arm_p2pk_n,
+                        arm_p2pk_ns,
+                        arm_p2sh_msig_n,
+                        arm_p2sh_msig_ns,
+                        arm_p2wpkh_n,
+                        arm_p2wpkh_ns,
+                        arm_p2wsh_n,
+                        arm_p2wsh_ns,
+                        arm_fallback_n,
+                        arm_fallback_ns,
+                    ) = crate::script_profile::get_and_reset_arm_stats();
+                    let (
+                        fb_nested_n,
+                        fb_nested_ns,
+                        fb_p2sh_other_n,
+                        fb_p2sh_other_ns,
+                        fb_native_wit_n,
+                        fb_native_wit_ns,
+                        fb_other_n,
+                        fb_other_ns,
+                    ) = crate::script_profile::get_and_reset_fallback_shape_stats();
                     let sighash_ms = sighash_ns as f64 / 1_000_000.0;
                     let interpreter_ms = interpreter_ns as f64 / 1_000_000.0;
-                    let multisig_ms = multisig_ns as f64 / 1_000_000.0;
+                    let checkmultisig_ecdsa_ms = multisig_ns as f64 / 1_000_000.0;
                     let p2pkh_parse_ms = p2pkh_parse_ns as f64 / 1_000_000.0;
                     let p2pkh_hash160_ms = p2pkh_hash160_ns as f64 / 1_000_000.0;
                     let p2pkh_collect_ms = p2pkh_collect_ns as f64 / 1_000_000.0;
@@ -1771,14 +2879,14 @@ pub(crate) fn connect_block_inner<'a>(
                     // script_checks_queued = inputs sent to ScriptCheckQueue (0 when assume-valid skips signatures).
                     // (Former field ecdsa_sigs was always 0 here — misleading vs real verification.)
                     profile_log!(
-                        "[PERF] Block {}: total={:?} (validation_loop={:?} batch={:?}), script_sub: sighash={:.2}ms interpreter={:.2}ms multisig={:.2}ms p2pkh_entry={:.2}ms p2pkh_parse={:.2}ms p2pkh_hash160={:.2}ms p2pkh_bip66={:.2}ms p2pkh_collect={:.2}ms p2pkh_secp={:.2}ms collect_slot={:.2}ms collect_lock={:.2}ms collect_copy={:.2}ms collect_chunk={:.2}ms worker_refs={:.2}ms worker_p2pkh={:.2}ms worker_refs_lock={:.2}ms run_check_loop={:.2}ms results_extend={:.2}ms batch_extract={:.2}ms batch_secp={:.2}ms batch_cache={:.2}ms drain_copy={:.2}ms drain_parse={:.2}ms drain_secp={:.2}ms ecdsa_cache_hits={} ecdsa_cache_misses={}, structure={:?}, input_lookup={:?}, check_inputs={:?}, overlay_apply={:?}, txs={} inputs={} schnorr_batch_sigs={} script_checks_queued={}",
+                        "[PERF] Block {}: total={:?} (validation_loop={:?} batch={:?}), script_sub: sighash={:.2}ms interpreter={:.2}ms checkmultisig_ecdsa={:.2}ms p2pkh_entry={:.2}ms p2pkh_parse={:.2}ms p2pkh_hash160={:.2}ms p2pkh_bip66={:.2}ms p2pkh_collect={:.2}ms p2pkh_secp={:.2}ms collect_slot={:.2}ms collect_lock={:.2}ms collect_copy={:.2}ms collect_chunk={:.2}ms worker_refs={:.2}ms worker_p2pkh={:.2}ms worker_refs_lock={:.2}ms run_check_loop={:.2}ms results_extend={:.2}ms batch_extract={:.2}ms batch_secp={:.2}ms batch_cache={:.2}ms drain_copy={:.2}ms drain_parse={:.2}ms drain_secp={:.2}ms ecdsa_cache_hits={} ecdsa_cache_misses={}, arms: p2pkh={}/{:.2}ms p2pk={}/{:.2}ms p2sh_msig={}/{:.2}ms p2wpkh={}/{:.2}ms p2wsh={}/{:.2}ms fallback={}/{:.2}ms, fb_shapes: nested_p2wsh={}/{:.2}ms p2sh_other={}/{:.2}ms native_wit={}/{:.2}ms other={}/{:.2}ms, structure={:?}, input_lookup={:?}, check_inputs={:?}, overlay_apply={:?}, txs={} inputs={} schnorr_batch_sigs={} script_checks_queued={}",
                         height,
                         total_with_batch,
                         total_script_time,
                         total_batch_time,
                         sighash_ms,
                         interpreter_ms,
-                        multisig_ms,
+                        checkmultisig_ecdsa_ms,
                         p2pkh_entry_ms,
                         p2pkh_parse_ms,
                         p2pkh_hash160_ms,
@@ -1802,6 +2910,26 @@ pub(crate) fn connect_block_inner<'a>(
                         drain_secp_ms,
                         ecdsa_cache_hits,
                         ecdsa_cache_misses,
+                        arm_p2pkh_n,
+                        arm_p2pkh_ns as f64 / 1_000_000.0,
+                        arm_p2pk_n,
+                        arm_p2pk_ns as f64 / 1_000_000.0,
+                        arm_p2sh_msig_n,
+                        arm_p2sh_msig_ns as f64 / 1_000_000.0,
+                        arm_p2wpkh_n,
+                        arm_p2wpkh_ns as f64 / 1_000_000.0,
+                        arm_p2wsh_n,
+                        arm_p2wsh_ns as f64 / 1_000_000.0,
+                        arm_fallback_n,
+                        arm_fallback_ns as f64 / 1_000_000.0,
+                        fb_nested_n,
+                        fb_nested_ns as f64 / 1_000_000.0,
+                        fb_p2sh_other_n,
+                        fb_p2sh_other_ns as f64 / 1_000_000.0,
+                        fb_native_wit_n,
+                        fb_native_wit_ns as f64 / 1_000_000.0,
+                        fb_other_n,
+                        fb_other_ns as f64 / 1_000_000.0,
                         total_tx_structure_time,
                         total_input_lookup_time,
                         total_check_tx_inputs_time,
@@ -1859,7 +2987,7 @@ pub(crate) fn connect_block_inner<'a>(
             }
 
             if crate::config::use_overlay_delta() {
-                overlay_for_delta = Some(overlay);
+                overlay_for_delta = Some(overlay.into_changes());
             }
         }
 
@@ -2069,14 +3197,14 @@ pub(crate) fn connect_block_inner<'a>(
                     } else {
                         None
                     };
-                    // For non-SegWit txs with ≥2 P2PKH/SIGHASH_ALL inputs, precompute all sighashes
-                    // at once using forward-midstate sharing (halves O(N²) cost for large txs).
+                    // For non-SegWit txs with ≥2 inputs: precompute eligible P2PKH/SIGHASH_ALL
+                    // (midstate batch when all eligible; partial fill otherwise).
                     #[cfg(feature = "production")]
-                    let batch_sighashes: Option<Vec<[u8; 32]>> =
+                    let batch_sighashes: Vec<Option<[u8; 32]>> =
                         if !has_witness && tx.inputs.len() >= 2 {
                             try_batch_precompute_sighashes_ibd(tx, &prevout_script_pubkeys_reusable)
                         } else {
-                            None
+                            vec![None; tx.inputs.len()]
                         };
                     for (j, input) in tx.inputs.iter().enumerate() {
                         // Reuse input_utxos instead of overlay.get()
@@ -2084,12 +3212,13 @@ pub(crate) fn connect_block_inner<'a>(
                             let witness_elem = tx_witnesses.and_then(|w| w.get(j));
                             let witness_for_script = witness_elem
                                 .and_then(|w| if is_witness_empty(w) { None } else { Some(w) });
+                            let input_flags = flags;
 
                             if !verify_script_with_context_full(
                                 &input.script_sig,
                                 &utxo.script_pubkey,
                                 witness_for_script,
-                                flags,
+                                input_flags,
                                 tx,
                                 j,
                                 &prevout_values_reusable,
@@ -2109,9 +3238,11 @@ pub(crate) fn connect_block_inner<'a>(
                                 #[cfg(not(feature = "production"))]
                                 None,
                                 #[cfg(feature = "production")]
-                                batch_sighashes.as_ref().and_then(|v| v.get(j)).copied(), // precomputed_sighash_all
+                                batch_sighashes.get(j).copied().flatten(), // precomputed_sighash_all
                                 #[cfg(feature = "production")]
                                 None, // precomputed_p2pkh_hash
+                                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                                None, // ecdsa_collect
                             )? {
                                 return invalid_block_result(
                                     utxo_set,
@@ -2146,7 +3277,13 @@ pub(crate) fn connect_block_inner<'a>(
                 input_utxos_reusable.clear();
                 let overlay_apply_start = std::time::Instant::now();
                 let tx_id = tx_ids[i];
-                apply_transaction_to_overlay_no_undo(&mut overlay, tx, tx_id, height);
+                apply_transaction_to_overlay_no_undo_cached(
+                    &mut overlay,
+                    tx,
+                    tx_id,
+                    height,
+                    None,
+                );
                 total_overlay_apply_time += overlay_apply_start.elapsed();
 
                 if fee < 0 {
@@ -2359,12 +3496,12 @@ pub(crate) fn connect_block_inner<'a>(
 
                 // Batch-precompute sighashes for large non-SegWit P2PKH/SIGHASH_ALL txs (halves O(N²) cost).
                 #[cfg(feature = "production")]
-                let batch_sighashes: Option<Vec<[u8; 32]>> = if !has_witness && tx.inputs.len() >= 2
-                {
-                    try_batch_precompute_sighashes_ibd(tx, &prevout_script_pubkeys_reusable)
-                } else {
-                    None
-                };
+                let batch_sighashes: Vec<Option<[u8; 32]>> =
+                    if !has_witness && tx.inputs.len() >= 2 {
+                        try_batch_precompute_sighashes_ibd(tx, &prevout_script_pubkeys_reusable)
+                    } else {
+                        vec![None; tx.inputs.len()]
+                    };
 
                 for (j, input) in tx.inputs.iter().enumerate() {
                     if let Some(utxo) = input_utxos.get(j).and_then(|opt| *opt) {
@@ -2375,13 +3512,14 @@ pub(crate) fn connect_block_inner<'a>(
                         let witness_stack = tx_witnesses.and_then(|tx_wits| tx_wits.get(j));
                         let witness_for_script = witness_stack
                             .and_then(|w| if is_witness_empty(w) { None } else { Some(w) });
+                        let input_flags = flags;
 
                         // Use verify_script_with_context_full for BIP65/112 support
                         if !verify_script_with_context_full(
                             &input.script_sig,
                             &utxo.script_pubkey,
                             witness_for_script,
-                            flags,
+                            input_flags,
                             tx,
                             j, // Input index
                             &prevout_values_reusable,
@@ -2401,9 +3539,11 @@ pub(crate) fn connect_block_inner<'a>(
                             #[cfg(not(feature = "production"))]
                             None,
                             #[cfg(feature = "production")]
-                            batch_sighashes.as_ref().and_then(|v| v.get(j)).copied(), // precomputed_sighash_all
+                            batch_sighashes.get(j).copied().flatten(), // precomputed_sighash_all
                             #[cfg(feature = "production")]
                             None, // precomputed_p2pkh_hash
+                            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                            None, // ecdsa_collect
                         )? {
                             return invalid_block_result(
                                 utxo_set,
@@ -2438,7 +3578,7 @@ pub(crate) fn connect_block_inner<'a>(
             prevout_script_pubkeys_reusable.clear();
             input_utxos_reusable.clear();
             let tx_id = tx_ids[i];
-            apply_transaction_to_overlay_no_undo(&mut overlay, tx, tx_id, height);
+            apply_transaction_to_overlay_no_undo_cached(&mut overlay, tx, tx_id, height, None);
 
             // Use checked arithmetic to prevent fee overflow
             if fee < 0 {
@@ -2513,8 +3653,11 @@ pub(crate) fn connect_block_inner<'a>(
             // Skip witness commitment only on trusted assume-valid IBD replay (same invariant
             // as merkle-mutation skip). Recent IBD blocks and all non-IBD connects validate.
             if !(ibd_mode && skip_signatures) {
-                let witness_merkle_root =
-                    crate::segwit::compute_witness_merkle_root_from_nested(block, witnesses)?;
+                let witness_merkle_root = crate::segwit::compute_witness_merkle_root_from_nested(
+                    block,
+                    witnesses,
+                    Some(tx_ids),
+                )?;
                 // `Hash` is 32 bytes; commitment compares to header field directly.
 
                 if !validate_witness_commitment(coinbase, &witness_merkle_root, &witnesses[0])? {
@@ -2557,8 +3700,7 @@ pub(crate) fn connect_block_inner<'a>(
 
     #[cfg(feature = "production")]
     if crate::config::use_overlay_delta() {
-        if let Some(overlay) = overlay_for_delta {
-            let (additions_arc, deletions) = overlay.into_changes();
+        if let Some((additions_arc, deletions)) = overlay_for_delta {
             let mut undo_log = crate::reorganization::BlockUndoLog::new();
             let bip30_for_merge = if maintain_bip30_index {
                 bip30_index
@@ -2885,7 +4027,7 @@ mod sighash_batch_ibd_tests {
     }
 
     fn assert_batch_matches_reference(tx: &Transaction, prevouts: &[&[u8]]) {
-        let batch = try_batch_precompute_sighashes_ibd(tx, prevouts).expect("batch eligible");
+        let batch = try_batch_precompute_sighashes_ibd(tx, prevouts);
         assert_eq!(batch.len(), tx.inputs.len());
         let spk = p2pkh_spk_bytes();
         for i in 0..tx.inputs.len() {
@@ -2896,7 +4038,8 @@ mod sighash_batch_ibd_tests {
                 sig[sig.len() - 1]
             };
             let refh = compute_legacy_sighash_nocache(tx, i, spk.as_slice(), sighash_byte);
-            assert_eq!(batch[i], refh, "input {i} sighash mismatch");
+            let got = batch[i].expect("eligible slot filled");
+            assert_eq!(got, refh, "input {i} sighash mismatch");
         }
     }
 
@@ -2924,9 +4067,56 @@ mod sighash_batch_ibd_tests {
         append_fake_pubkey(&mut v);
         let tx = sample_tx_two_p2pkh(v.clone(), v);
         let spk = p2pkh_spk_bytes();
+        let batch =
+            try_batch_precompute_sighashes_ibd(&tx, &[spk.as_slice(), spk.as_slice()]);
         assert!(
-            try_batch_precompute_sighashes_ibd(&tx, &[spk.as_slice(), spk.as_slice()]).is_none(),
-            "batch must not activate for ANYONECANPAY"
+            batch.iter().all(|h| h.is_none()),
+            "ANYONECANPAY slots must stay None"
         );
+    }
+
+    #[test]
+    fn batch_accepts_legacy_sighash_all_zero() {
+        let mut v = Vec::new();
+        v.push(71);
+        v.extend(std::iter::repeat_n(0x30u8, 70));
+        v.push(0x00); // legacy SIGHASH_ALL
+        append_fake_pubkey(&mut v);
+        let tx = sample_tx_two_p2pkh(v.clone(), v);
+        let spk = p2pkh_spk_bytes();
+        assert_batch_matches_reference(&tx, &[spk.as_slice(), spk.as_slice()]);
+    }
+
+    #[test]
+    fn batch_partial_fills_eligible_only() {
+        let mut acp = Vec::new();
+        acp.push(71);
+        acp.extend(std::iter::repeat_n(0x30u8, 69));
+        acp.push(0x30);
+        acp.push(0x81u8);
+        append_fake_pubkey(&mut acp);
+        let tx = sample_tx_two_p2pkh(script_sig_compact(), acp);
+        let spk = p2pkh_spk_bytes();
+        let batch =
+            try_batch_precompute_sighashes_ibd(&tx, &[spk.as_slice(), spk.as_slice()]);
+        assert!(batch[0].is_some(), "plain ALL input precomputed");
+        assert!(batch[1].is_none(), "ANYONECANPAY left to worker");
+        let (sig, _) =
+            crate::script::parse_p2pkh_script_sig(tx.inputs[0].script_sig.as_slice()).unwrap();
+        let refh = compute_legacy_sighash_nocache(&tx, 0, spk.as_slice(), sig[sig.len() - 1]);
+        assert_eq!(batch[0].unwrap(), refh);
+    }
+
+    #[test]
+    fn p2pkh_hash160_precomp_matches_inline() {
+        use digest::Digest;
+        let ss = script_sig_compact();
+        let pre = super::try_precompute_p2pkh_hash160(ss.as_slice()).expect("parseable");
+        let (_, pk) = crate::script::parse_p2pkh_script_sig(ss.as_slice()).unwrap();
+        let expect: [u8; 20] = ripemd::Ripemd160::digest(
+            crate::crypto::OptimizedSha256::new().hash(pk),
+        )
+        .into();
+        assert_eq!(pre, expect);
     }
 }

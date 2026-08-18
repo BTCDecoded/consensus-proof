@@ -394,6 +394,84 @@ fn test_production_legacy_sighash_nocache_and_buffered_match() {
     assert_eq!(batch[0], nocache);
 }
 
+/// Dens: plain-ALL specialized nocache ≡ buffered for 0x01 and legacy 0x00; non-ALL still agrees.
+#[cfg(feature = "production")]
+#[test]
+fn plain_all_nocache_matches_buffered_and_non_all() {
+    use blvm_consensus::transaction_hash::{
+        compute_legacy_sighash_buffered, compute_legacy_sighash_nocache,
+    };
+
+    let tx = sample_tx();
+    let script_code = vec![OP_1, OP_2, OP_3];
+    for sh in [0x01u8, 0x00u8, 0x02u8, 0x03u8, 0x81u8] {
+        for i in 0..tx.inputs.len() {
+            if sh == 0x03 && i >= tx.outputs.len() {
+                continue;
+            }
+            let a = compute_legacy_sighash_nocache(&tx, i, &script_code, sh);
+            let b = compute_legacy_sighash_buffered(&tx, i, &script_code, sh);
+            assert_eq!(a, b, "nocache≠buffered sighash={sh:#x} input={i}");
+        }
+    }
+}
+
+/// N8: single-pass midstate batch ≡ nocache for every input; batch beats N× nocache.
+#[cfg(feature = "production")]
+#[test]
+fn n8_legacy_midstate_batch_matches_nocache_and_micro() {
+    use blvm_consensus::transaction_hash::{
+        compute_legacy_sighash_nocache, compute_sighashes_batch,
+    };
+
+    let mut inputs = Vec::new();
+    for i in 0..8u8 {
+        inputs.push(TransactionInput {
+            prevout: OutPoint {
+                hash: [i; 32],
+                index: i as u32,
+            },
+            script_sig: vec![].into(),
+            sequence: 0xffffffff,
+        });
+    }
+    let tx = Transaction {
+        version: 1,
+        inputs: inputs.into(),
+        outputs: vec![TransactionOutput {
+            value: 50_000,
+            script_pubkey: vec![OP_1].into(),
+        }]
+        .into(),
+        lock_time: 0,
+    };
+    let script_code = vec![OP_1, OP_2, OP_3];
+    let script_codes: Vec<&[u8]> = vec![&script_code; tx.inputs.len()];
+    let sighash_bytes = vec![SighashType::ALL.0; tx.inputs.len()];
+    let batch = compute_sighashes_batch(&tx, &script_codes, &sighash_bytes);
+    for i in 0..tx.inputs.len() {
+        let refh = compute_legacy_sighash_nocache(&tx, i, &script_code, SighashType::ALL.0);
+        assert_eq!(batch[i], refh, "N8 midstate mismatch at input {i}");
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 {
+        let _ = compute_sighashes_batch(&tx, &script_codes, &sighash_bytes);
+    }
+    let batch_ns = t0.elapsed().as_nanos() / 200;
+    let t1 = std::time::Instant::now();
+    for _ in 0..200 {
+        for i in 0..tx.inputs.len() {
+            let _ = compute_legacy_sighash_nocache(&tx, i, &script_code, SighashType::ALL.0);
+        }
+    }
+    let nocache_ns = t1.elapsed().as_nanos() / 200;
+    eprintln!("[N8 micro] batch≈{batch_ns} ns/tx nocache≈{nocache_ns} ns/tx (8-in)");
+    assert!(
+        batch_ns < nocache_ns,
+        "N8 batch should beat N× nocache"
+    );
+}
+
 #[cfg(feature = "production")]
 #[test]
 fn test_batch_compute_legacy_sighashes_matches_single() {

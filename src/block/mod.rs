@@ -152,6 +152,7 @@ pub fn connect_block(
     let block_arc = None;
     let (result, new_utxo_set, _tx_ids, undo_log, _delta) = connect::connect_block_inner(
         block, witnesses, utxo_set, None, height, context, None, None, block_arc, false, None,
+        None,
     )?;
     Ok((result, new_utxo_set, undo_log))
 }
@@ -193,6 +194,7 @@ pub fn connect_block_with_chainwork(
         block_arc,
         false,
         best_header_chainwork,
+        None,
     )?;
     Ok((result, new_utxo_set, undo_log))
 }
@@ -241,6 +243,7 @@ pub fn connect_block_ibd<'a>(
         block_arc,
         true,
         best_header_chainwork,
+        None,
     )?;
     Ok((result, new_utxo_set, tx_ids, utxo_delta))
 }
@@ -258,6 +261,7 @@ pub fn connect_block_ibd_with_undo<'a>(
     block_arc: Option<std::sync::Arc<Block>>,
     witnesses_arc: Option<&std::sync::Arc<Vec<Vec<Witness>>>>,
     best_header_chainwork: Option<crate::pow::U256>,
+    ibd_utxo_lookup: Option<&dyn crate::utxo_overlay::UtxoLookup>,
 ) -> Result<(
     ValidationResult,
     UtxoSet,
@@ -277,6 +281,7 @@ pub fn connect_block_ibd_with_undo<'a>(
         block_arc,
         true,
         best_header_chainwork,
+        ibd_utxo_lookup,
     )?;
     Ok((result, new_utxo_set, tx_ids, utxo_delta, undo_log))
 }
@@ -299,6 +304,15 @@ fn build_time_context<H: AsRef<BlockHeader>>(
     })
 }
 
+/// Pre-built IBD block output map (I2): shared `Arc<UTXO>` per outpoint.
+#[cfg(feature = "production")]
+pub type IbdBlockOutputCache =
+    std::sync::Arc<rustc_hash::FxHashMap<crate::types::OutPoint, std::sync::Arc<crate::types::UTXO>>>;
+#[cfg(not(feature = "production"))]
+pub type IbdBlockOutputCache = std::sync::Arc<
+    std::collections::HashMap<crate::types::OutPoint, std::sync::Arc<crate::types::UTXO>>,
+>;
+
 /// Block validation context: time, network, fork activation, and optional rule data.
 ///
 /// Built by the node from headers, clock, chain params, version-bits, and config.
@@ -317,6 +331,8 @@ pub struct BlockValidationContext {
     pub bip54_boundary: Option<crate::types::Bip54BoundaryTimestamps>,
     /// Optional signet challenge script override (BIP325); default from `signet::default_signet_challenge`.
     pub signet_challenge: Option<ByteString>,
+    /// IBD assume-valid: pre-built output `Arc<UTXO>` map for overlay apply (I2).
+    pub ibd_block_outputs: Option<IbdBlockOutputCache>,
 }
 
 impl BlockValidationContext {
@@ -340,6 +356,7 @@ impl BlockValidationContext {
             activation,
             bip54_boundary,
             signet_challenge: None,
+            ibd_block_outputs: None,
         }
     }
 
@@ -358,6 +375,7 @@ impl BlockValidationContext {
             activation,
             bip54_boundary,
             signet_challenge: None,
+            ibd_block_outputs: None,
         }
     }
 

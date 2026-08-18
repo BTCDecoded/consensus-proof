@@ -11,6 +11,7 @@ use blvm_consensus::segwit::{
 use blvm_consensus::{
     Block, BlockHeader, OutPoint, Transaction, TransactionInput, TransactionOutput,
 };
+use blvm_consensus::block::{calculate_tx_id, compute_block_tx_ids};
 
 const WITNESS_COMMITMENT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
@@ -138,7 +139,7 @@ fn test_compute_witness_merkle_root_matches_nested_flat_layout() {
     };
     let nested: Vec<Vec<Witness>> = vec![vec![vec![vec![0x01; 32]]]];
     let flat: Vec<Witness> = vec![nested[0][0].clone()];
-    let root_nested = compute_witness_merkle_root_from_nested(&block, &nested).unwrap();
+    let root_nested = compute_witness_merkle_root_from_nested(&block, &nested, None).unwrap();
     let root_flat = compute_witness_merkle_root(&block, &flat).unwrap();
     assert_eq!(root_nested, root_flat);
 }
@@ -158,7 +159,7 @@ fn test_validate_witness_commitment_accepts_matching_op_return() {
         transactions: vec![coinbase(50_000_000_000)].into(),
     };
     let witnesses: Vec<Vec<Witness>> = vec![vec![vec![nonce.to_vec()]]];
-    let root = compute_witness_merkle_root_from_nested(&block, &witnesses).unwrap();
+    let root = compute_witness_merkle_root_from_nested(&block, &witnesses, None).unwrap();
 
     let mut cb = coinbase(50_000_000_000);
     cb.outputs = vec![
@@ -203,6 +204,34 @@ fn test_validate_witness_commitment_rejects_wrong_hash() {
 }
 
 #[test]
+fn test_coinbase_witness_must_be_exactly_one_32_byte_item() {
+    let nonce = [0x22u8; 32];
+    let root = [0x33u8; 32];
+    let cb = Transaction {
+        version: 2,
+        inputs: vec![TransactionInput {
+            prevout: OutPoint {
+                hash: [0; 32],
+                index: 0xffffffff,
+            },
+            script_sig: vec![OP_1].into(),
+            sequence: 0xffffffff,
+        }]
+        .into(),
+        outputs: vec![TransactionOutput {
+            value: 0,
+            script_pubkey: witness_commitment_script(&[0xff; 32], &nonce).into(),
+        }]
+        .into(),
+        lock_time: 0,
+    };
+    let short = vec![vec![vec![0x22u8; 16]]];
+    assert!(!validate_witness_commitment(&cb, &root, &short).unwrap());
+    let extra = vec![vec![nonce.to_vec(), vec![0x01]]];
+    assert!(!validate_witness_commitment(&cb, &root, &extra).unwrap());
+}
+
+#[test]
 fn test_validate_witness_commitment_accepts_missing_commitment_output() {
     let cb = coinbase(50_000_000_000);
     let root = [0x44u8; 32];
@@ -225,7 +254,7 @@ fn test_validate_witness_commitment_uses_last_matching_output() {
         transactions: vec![coinbase(50_000_000_000)].into(),
     };
     let witnesses: Vec<Vec<Witness>> = vec![vec![vec![nonce.to_vec()]]];
-    let root = compute_witness_merkle_root_from_nested(&block, &witnesses).unwrap();
+    let root = compute_witness_merkle_root_from_nested(&block, &witnesses, None).unwrap();
 
     let mut cb = coinbase(50_000_000_000);
     cb.outputs = vec![
@@ -245,6 +274,81 @@ fn test_validate_witness_commitment_uses_last_matching_output() {
     .into();
 
     assert!(validate_witness_commitment(&cb, &root, &witnesses[0]).unwrap());
+}
+
+#[test]
+fn test_witness_merkle_reuses_tx_ids_for_legacy_leaves() {
+    // KAT: mixed coinbase + legacy + segwit block — tx_ids path must match re-hash path.
+    let legacy = Transaction {
+        version: 1,
+        inputs: vec![TransactionInput {
+            prevout: OutPoint {
+                hash: [0x11; 32],
+                index: 0,
+            },
+            script_sig: vec![OP_1].into(),
+            sequence: 0xffffffff,
+        }]
+        .into(),
+        outputs: vec![TransactionOutput {
+            value: 49_000_000_000,
+            script_pubkey: vec![OP_1].into(),
+        }]
+        .into(),
+        lock_time: 0,
+    };
+    let segwit = Transaction {
+        version: 2,
+        inputs: vec![TransactionInput {
+            prevout: OutPoint {
+                hash: [0x22; 32],
+                index: 1,
+            },
+            script_sig: vec![].into(),
+            sequence: 0xffffffff,
+        }]
+        .into(),
+        outputs: vec![TransactionOutput {
+            value: 1_000,
+            script_pubkey: p2wpkh_scriptpubkey().into(),
+        }]
+        .into(),
+        lock_time: 0,
+    };
+    let block = Block {
+        header: BlockHeader {
+            version: 4,
+            prev_block_hash: [0; 32],
+            merkle_root: [0; 32],
+            timestamp: 1_500_000_000,
+            bits: 0x0300ffff,
+            nonce: 0,
+        },
+        transactions: vec![coinbase(50_000_000_000), legacy, segwit].into(),
+    };
+    let witnesses: Vec<Vec<Witness>> = vec![
+        vec![vec![vec![0x01; 32]]], // coinbase reserved nonce
+        vec![vec![]],               // legacy: empty witness stack
+        vec![vec![vec![0x30; 72], vec![0x21; 33]]], // segwit signature + pubkey
+    ];
+    let tx_ids = compute_block_tx_ids(&block);
+    let legacy_txid = calculate_tx_id(&block.transactions[1]);
+
+    let root_rehash =
+        compute_witness_merkle_root_from_nested(&block, &witnesses, None).unwrap();
+    let root_reuse =
+        compute_witness_merkle_root_from_nested(&block, &witnesses, Some(&tx_ids)).unwrap();
+    assert_eq!(
+        root_rehash, root_reuse,
+        "precomputed tx_ids path must agree with legacy re-hash path"
+    );
+    assert_eq!(tx_ids[1], legacy_txid, "sanity: legacy leaf txid");
+
+    // Wrong tx_ids length is rejected before merkle computation.
+    let bad_ids = vec![tx_ids[0]];
+    assert!(
+        compute_witness_merkle_root_from_nested(&block, &witnesses, Some(&bad_ids)).is_err()
+    );
 }
 
 #[test]

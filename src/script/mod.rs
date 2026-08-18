@@ -581,6 +581,18 @@ fn eval_script_inner(
             };
 
             if !in_false_branch {
+                let max_element = MAX_SCRIPT_ELEMENT_SIZE;
+                if data.len() > max_element {
+                    return Err(ConsensusError::ScriptErrorWithCode {
+                        code: ScriptErrorCode::PushSize,
+                        message: format!(
+                            "Push data size {} exceeds maximum {}",
+                            data.len(),
+                            max_element
+                        )
+                        .into(),
+                    });
+                }
                 stack.push(to_stack_element(data));
             }
             i += advance;
@@ -907,6 +919,8 @@ pub fn verify_script_with_context(
         None, // sighash_cache
         #[cfg(feature = "production")]
         None, // precomputed_p2pkh_hash
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None, // ecdsa_collect
     )
 }
 
@@ -1189,16 +1203,52 @@ pub fn verify_p2pkh_inline(
     height: u64,
     network: crate::types::Network,
     precomputed_sighash_all: Option<[u8; 32]>,
+    precomputed_p2pkh_hash: Option<[u8; 20]>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+) -> Result<bool> {
+    let (signature_bytes, pubkey_bytes) = match parse_p2pkh_script_sig(script_sig) {
+        Some(pair) => pair,
+        None => return Ok(false),
+    };
+    verify_p2pkh_inline_parsed(
+        signature_bytes,
+        pubkey_bytes,
+        script_pubkey,
+        flags,
+        tx,
+        input_index,
+        height,
+        network,
+        precomputed_sighash_all,
+        precomputed_p2pkh_hash,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        ecdsa_collect,
+    )
+}
+
+/// Like [`verify_p2pkh_inline`] but skips a second `parse_p2pkh_script_sig` when the
+/// caller already parsed (IBD serial / collect hot path).
+#[cfg(feature = "production")]
+#[inline]
+pub fn verify_p2pkh_inline_parsed(
+    signature_bytes: &[u8],
+    pubkey_bytes: &[u8],
+    script_pubkey: &[u8],
+    flags: u32,
+    tx: &Transaction,
+    input_index: usize,
+    height: u64,
+    network: crate::types::Network,
+    precomputed_sighash_all: Option<[u8; 32]>,
+    precomputed_p2pkh_hash: Option<[u8; 20]>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
 ) -> Result<bool> {
     #[cfg(feature = "profile")]
     let _t0 = std::time::Instant::now();
 
     let expected_hash = &script_pubkey[3..23];
-
-    let (signature_bytes, pubkey_bytes) = match parse_p2pkh_script_sig(script_sig) {
-        Some(pair) => pair,
-        None => return Ok(false),
-    };
 
     if (pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65) || signature_bytes.is_empty() {
         return Ok(false);
@@ -1207,8 +1257,13 @@ pub fn verify_p2pkh_inline(
     #[cfg(feature = "profile")]
     let _t_hash = std::time::Instant::now();
 
-    let sha256_hash = OptimizedSha256::new().hash(pubkey_bytes);
-    let pubkey_hash: [u8; 20] = Ripemd160::digest(sha256_hash).into();
+    let pubkey_hash: [u8; 20] = match precomputed_p2pkh_hash {
+        Some(h) => h,
+        None => {
+            let sha256_hash = OptimizedSha256::new().hash(pubkey_bytes);
+            Ripemd160::digest(sha256_hash).into()
+        }
+    };
     if &pubkey_hash[..] != expected_hash {
         return Ok(false);
     }
@@ -1223,7 +1278,8 @@ pub fn verify_p2pkh_inline(
     let sighash = if let Some(precomp) = precomputed_sighash_all {
         precomp
     } else {
-        crate::transaction_hash::compute_legacy_sighash_buffered(
+        // Incremental hasher (REVERT calculate-path: S10 189.4 vs nocache 195.6).
+        crate::transaction_hash::compute_legacy_sighash_nocache(
             tx,
             input_index,
             script_pubkey,
@@ -1261,6 +1317,40 @@ pub fn verify_p2pkh_inline(
     #[cfg(feature = "profile")]
     let _t_secp = std::time::Instant::now();
 
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    if let Some((collector, global_idx)) = ecdsa_collect {
+        // Defer secp to block-end batch (CPU / optional GPU). Need compressed pk + compact sig.
+        let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+            der_sig,
+            strict_der,
+            enforce_low_s,
+        ) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        let pk33 = match pubkey_bytes.len() {
+            33 => {
+                let mut a = [0u8; 33];
+                a.copy_from_slice(pubkey_bytes);
+                a
+            }
+            65 => {
+                match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                    Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                    None => return Ok(false),
+                }
+            }
+            _ => return Ok(false),
+        };
+        #[cfg(feature = "profile")]
+        {
+            crate::script_profile::add_p2pkh_collect_ns(_t_secp.elapsed().as_nanos() as u64);
+            crate::script_profile::add_p2pkh_fast_path_entry_ns(_t0.elapsed().as_nanos() as u64);
+        }
+        collector.collect_with_index(global_idx, &sighash, &pk33, &compact);
+        return Ok(true);
+    }
+
     let result = crate::secp256k1_backend::verify_ecdsa_direct(
         der_sig,
         pubkey_bytes,
@@ -1290,6 +1380,8 @@ pub fn verify_p2pk_inline(
     input_index: usize,
     height: u64,
     network: crate::types::Network,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
 ) -> Result<bool> {
     let pk_len = script_pubkey.len() - 2; // 33 or 65
     let pubkey_bytes = &script_pubkey[1..1 + pk_len];
@@ -1305,7 +1397,7 @@ pub fn verify_p2pk_inline(
     let sighash_byte = signature_bytes[signature_bytes.len() - 1];
     let script_code: &[u8] = script_pubkey; // P2PK scriptPubKey < 71 bytes, no FindAndDelete
 
-    let sighash = crate::transaction_hash::compute_legacy_sighash_buffered(
+    let sighash = crate::transaction_hash::compute_legacy_sighash_nocache(
         tx,
         input_index,
         script_code,
@@ -1336,6 +1428,32 @@ pub fn verify_p2pk_inline(
         }
     }
 
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    if let Some((collector, global_idx)) = ecdsa_collect {
+        let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+            der_sig,
+            strict_der,
+            enforce_low_s,
+        ) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        let pk33 = match pubkey_bytes.len() {
+            33 => {
+                let mut a = [0u8; 33];
+                a.copy_from_slice(pubkey_bytes);
+                a
+            }
+            65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                None => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        collector.collect_with_index(global_idx, &sighash, &pk33, &compact);
+        return Ok(true);
+    }
+
     Ok(crate::secp256k1_backend::verify_ecdsa_direct(
         der_sig,
         pubkey_bytes,
@@ -1347,7 +1465,7 @@ pub fn verify_p2pk_inline(
 }
 
 /// P2SH-multisig fast path: when redeem script matches `OP_m <pubkeys> OP_n OP_CHECKMULTISIG`,
-/// verify each (sig, pubkey, sighash) inline via ecdsa::verify(), avoiding the interpreter.
+/// verify inline or defer cartesian trials to [`EcdsaSignatureCollector`] when provided.
 /// Returns Some(Ok(true/false)) if we handled it, None to fall through to interpreter.
 #[allow(clippy::too_many_arguments)]
 fn try_verify_p2sh_multisig_fast_path(
@@ -1363,7 +1481,18 @@ fn try_verify_p2sh_multisig_fast_path(
     #[cfg(feature = "production")] sighash_cache: Option<
         &crate::transaction_hash::SighashMidstateCache,
     >,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
 ) -> Option<Result<bool>> {
+    let _ = prevout_script_pubkeys;
+    // P2SH scriptPubKey: OP_HASH160 PUSH_20 <20> OP_EQUAL
+    if script_pubkey.len() != 23
+        || script_pubkey[0] != OP_HASH160
+        || script_pubkey[1] != PUSH_20_BYTES
+        || script_pubkey[22] != OP_EQUAL
+    {
+        return None;
+    }
     let pushes = parse_p2sh_script_sig_pushes(script_sig.as_ref())?;
     if pushes.len() < 2 {
         return None;
@@ -1400,13 +1529,99 @@ fn try_verify_p2sh_multisig_fast_path(
 
     let mut cleaned = redeem.to_vec();
     for sig in &signatures {
-        if !sig.is_empty() {
-            let pattern = serialize_push_data(sig);
-            cleaned = find_and_delete(&cleaned, &pattern).into_owned();
+        if sig.is_empty() {
+            continue;
         }
+        // Push encoding is ≥ sig.len()+1; FindAndDelete is a no-op when pattern can't fit.
+        if sig.len().saturating_add(1) > cleaned.len() {
+            continue;
+        }
+        let pattern = serialize_push_data(sig);
+        cleaned = find_and_delete(&cleaned, &pattern).into_owned();
     }
 
     use crate::transaction_hash::{SighashType, calculate_transaction_sighash_single_input};
+
+    // IBD deferral: cartesian oracle → SoA/GPU; Core match + NULLFAIL at block end.
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    if let Some(collector) = ecdsa_collector {
+        let nullfail = (flags & SCRIPT_VERIFY_NULLFAIL) != 0;
+        let enforce_low_s = (flags & flags::SCRIPT_VERIFY_LOW_S) != 0;
+        let strict_der = (flags & flags::SCRIPT_VERIFY_DERSIG) != 0
+            || (flags & flags::SCRIPT_VERIFY_STRICTENC) != 0
+            || (flags & flags::SCRIPT_VERIFY_LOW_S) != 0;
+        let mut trial_indices = Vec::new();
+        let mut sig_empty = Vec::with_capacity(signatures.len());
+        // Reuse sighash when multiple sigs share the same sighash byte (common m-of-n).
+        let mut sighash_by_type: Vec<(u8, [u8; 32])> = Vec::new();
+        for sig_bytes in &signatures {
+            if sig_bytes.is_empty() {
+                sig_empty.push(true);
+                continue;
+            }
+            sig_empty.push(false);
+            let sighash_byte = sig_bytes[sig_bytes.len() - 1];
+            let sighash = if let Some((_, h)) =
+                sighash_by_type.iter().find(|(b, _)| *b == sighash_byte)
+            {
+                *h
+            } else {
+                let sighash_type = SighashType::from_byte(sighash_byte);
+                let h = match calculate_transaction_sighash_single_input(
+                    tx,
+                    input_index,
+                    &cleaned,
+                    prevout_values[input_index],
+                    sighash_type,
+                    sighash_cache,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return Some(Err(e)),
+                };
+                sighash_by_type.push((sighash_byte, h));
+                h
+            };
+            let der_sig = &sig_bytes[..sig_bytes.len() - 1];
+            // Invalid DER / high-S: Core treats the sig as non-matching, not hard-fail
+            // (NULLFAIL applied at resolve when the overall match fails).
+            let compact = blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+                der_sig, strict_der, enforce_low_s,
+            );
+            for pubkey_bytes in &pubkeys {
+                let gidx = collector.alloc_multisig_trial_index();
+                trial_indices.push(gidx);
+                let Some(compact) = compact.as_ref() else {
+                    // No SoA row → resolve sees false (unwrap_or(false)).
+                    continue;
+                };
+                // Core skips invalid pubkeys (no match). Do not Ok(false) the spend —
+                // mainnet 442715/tx1351 is 2-of-3 with one off-curve PUB65.
+                let pk33 = match pubkey_bytes.len() {
+                    33 => {
+                        let mut a = [0u8; 33];
+                        a.copy_from_slice(pubkey_bytes);
+                        a
+                    }
+                    65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                        Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                collector.collect_with_index(gidx, &sighash, &pk33, compact);
+            }
+        }
+        collector.push_multisig_pending(crate::ecdsa_batch::MultisigPending {
+            m,
+            n_pubs: pubkeys.len(),
+            trial_indices,
+            sig_empty,
+            nullfail,
+        });
+        #[cfg(feature = "profile")]
+        crate::script_profile::note_arm_p2sh_multisig(0);
+        return Some(Ok(true));
+    }
 
     let mut sig_index = 0;
     let mut valid_sigs = 0u8;
@@ -1492,6 +1707,37 @@ fn try_verify_p2sh_multisig_fast_path(
     Some(Ok(valid_sigs >= m))
 }
 
+/// IBD entry: P2SH-multisig with optional SoA deferral (see [`try_verify_p2sh_multisig_fast_path`]).
+#[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_verify_p2sh_multisig_ibd(
+    script_sig: &ByteString,
+    script_pubkey: &[u8],
+    flags: u32,
+    tx: &Transaction,
+    input_index: usize,
+    prevout_values: &[i64],
+    prevout_script_pubkeys: &[&[u8]],
+    block_height: Option<u64>,
+    network: crate::types::Network,
+    sighash_cache: Option<&crate::transaction_hash::SighashMidstateCache>,
+    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
+) -> Option<Result<bool>> {
+    try_verify_p2sh_multisig_fast_path(
+        script_sig,
+        script_pubkey,
+        flags,
+        tx,
+        input_index,
+        prevout_values,
+        prevout_script_pubkeys,
+        block_height,
+        network,
+        sighash_cache,
+        ecdsa_collector,
+    )
+}
+
 /// Bare multisig fast path: scriptPubKey is `OP_n <pubkeys> OP_m OP_CHECKMULTISIG` directly.
 /// No P2SH wrapper; scriptSig is \[dummy, sig_1, ..., sig_m\]. Same verification as P2SH multisig.
 #[allow(clippy::too_many_arguments)]
@@ -1533,10 +1779,14 @@ fn try_verify_bare_multisig_fast_path(
 
     let mut cleaned = script_pubkey.to_vec();
     for sig in &signatures {
-        if !sig.is_empty() {
-            let pattern = serialize_push_data(sig);
-            cleaned = find_and_delete(&cleaned, &pattern).into_owned();
+        if sig.is_empty() {
+            continue;
         }
+        if sig.len().saturating_add(1) > cleaned.len() {
+            continue;
+        }
+        let pattern = serialize_push_data(sig);
+        cleaned = find_and_delete(&cleaned, &pattern).into_owned();
     }
 
     use crate::transaction_hash::{SighashType, calculate_transaction_sighash_single_input};
@@ -1645,6 +1895,8 @@ fn try_verify_p2sh_fast_path(
         &crate::transaction_hash::SighashMidstateCache,
     >,
     #[cfg(feature = "production")] precomputed_sighash_all: Option<[u8; 32]>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
 ) -> Option<Result<bool>> {
     const SCRIPT_VERIFY_P2SH: u32 = 0x01;
     if (flags & SCRIPT_VERIFY_P2SH) == 0 {
@@ -1755,6 +2007,61 @@ fn try_verify_p2sh_fast_path(
                     }
                 };
                 let height = block_height.unwrap_or(0);
+                let der_sig = &signature_bytes[..signature_bytes.len() - 1];
+                let strict_der = flags & 0x04 != 0;
+                let enforce_low_s = flags & 0x08 != 0;
+                if strict_der
+                    && !crate::bip_validation::check_bip66_network(
+                        signature_bytes,
+                        height,
+                        network,
+                    )
+                    .unwrap_or(false)
+                {
+                    return Some(Ok(false));
+                }
+                if flags & 0x02 != 0 {
+                    let sighash_base = signature_bytes[signature_bytes.len() - 1] & !0x80;
+                    if !(0x01..=0x03).contains(&sighash_base) {
+                        return Some(Ok(false));
+                    }
+                    match pubkey_bytes.len() {
+                        33 if pubkey_bytes[0] != 0x02 && pubkey_bytes[0] != 0x03 => {
+                            return Some(Ok(false));
+                        }
+                        65 if pubkey_bytes[0] != 0x04 => return Some(Ok(false)),
+                        33 | 65 => {}
+                        _ => return Some(Ok(false)),
+                    }
+                }
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                if let Some((collector, global_idx)) = ecdsa_collect {
+                    // Default-on; set BLVM_P2SH_P2PKH_SOA=0 to disable.
+                    if !std::env::var_os("BLVM_P2SH_P2PKH_SOA").is_some_and(|v| v == "0") {
+                        let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+                            der_sig,
+                            strict_der,
+                            enforce_low_s,
+                        ) {
+                            Some(c) => c,
+                            None => return Some(Ok(false)),
+                        };
+                        let pk33 = match pubkey_bytes.len() {
+                            33 => {
+                                let mut a = [0u8; 33];
+                                a.copy_from_slice(pubkey_bytes);
+                                a
+                            }
+                            65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                                Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                                None => return Some(Ok(false)),
+                            },
+                            _ => return Some(Ok(false)),
+                        };
+                        collector.collect_with_index(global_idx, &sighash, &pk33, &compact);
+                        return Some(Ok(true));
+                    }
+                }
                 let is_valid = signature::with_secp_context(|secp| {
                     signature::verify_signature(
                         secp,
@@ -1775,7 +2082,7 @@ fn try_verify_p2sh_fast_path(
     // P2SH-with-P2PK-redeem fast-path: redeem = OP_PUSHBYTES_N + pubkey + OP_CHECKSIG, stack = [sig]
     if (redeem.len() == 35 || redeem.len() == 67)
         && redeem[redeem.len() - 1] == OP_CHECKSIG
-        && (redeem[0] == 0x21 || redeem[0] == 0x41)
+        && (redeem[0] == PUSH_33_BYTES || redeem[0] == PUSH_65_BYTES)
         && stack.len() == 1
     {
         let pubkey_len = redeem.len() - 2;
@@ -1853,6 +2160,271 @@ fn try_verify_p2sh_fast_path(
     Some(result)
 }
 
+/// Native P2WPKH inline verify (BIP143). Caller must gate scriptPubKey / witness shape.
+#[cfg(feature = "production")]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn verify_p2wpkh_inline(
+    witness: &crate::witness::Witness,
+    script_pubkey: &[u8],
+    flags: u32,
+    tx: &Transaction,
+    input_index: usize,
+    prevout_value: i64,
+    height: u64,
+    network: crate::types::Network,
+    precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
+    precomputed_sighash_all: Option<[u8; 32]>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+) -> Result<bool> {
+    let signature_bytes = &witness[0];
+    let pubkey_bytes = &witness[1];
+    if (pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65) || signature_bytes.is_empty() {
+        return Ok(false);
+    }
+
+    let expected_hash = &script_pubkey[2..22];
+    let sha256_hash = OptimizedSha256::new().hash(pubkey_bytes);
+    let pubkey_hash = Ripemd160::digest(sha256_hash);
+    if &pubkey_hash[..] != expected_hash {
+        return Ok(false);
+    }
+
+    let p2pkh_script_code = bip143_p2wpkh_script_code(expected_hash);
+    let sighash_byte = signature_bytes[signature_bytes.len() - 1];
+    let sighash = if sighash_byte == 0x01 {
+        if let Some(precomp) = precomputed_sighash_all {
+            precomp
+        } else {
+            match crate::transaction_hash::calculate_bip143_sighash(
+                tx,
+                input_index,
+                &p2pkh_script_code,
+                prevout_value,
+                sighash_byte,
+                precomputed_bip143,
+            ) {
+                Ok(h) => h,
+                Err(e) => return Err(e),
+            }
+        }
+    } else {
+        match crate::transaction_hash::calculate_bip143_sighash(
+            tx,
+            input_index,
+            &p2pkh_script_code,
+            prevout_value,
+            sighash_byte,
+            precomputed_bip143,
+        ) {
+            Ok(h) => h,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let der_sig = &signature_bytes[..signature_bytes.len() - 1];
+    let strict_der = flags & 0x04 != 0;
+    let enforce_low_s = flags & 0x08 != 0;
+
+    if strict_der
+        && !crate::bip_validation::check_bip66_network(signature_bytes, height, network)
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    if flags & 0x02 != 0 {
+        let sighash_base = sighash_byte & !0x80;
+        if !(0x01..=0x03).contains(&sighash_base) {
+            return Ok(false);
+        }
+        match pubkey_bytes.len() {
+            33 if pubkey_bytes[0] != 0x02 && pubkey_bytes[0] != 0x03 => return Ok(false),
+            65 if pubkey_bytes[0] != 0x04 => return Ok(false),
+            33 | 65 => {}
+            _ => return Ok(false),
+        }
+    }
+
+    // P2WPKH SoA collect disabled: deferred GPU path false-rejected mainnet @497110 tx330.
+    // Default-on SoA collect; set BLVM_P2WPKH_SOA=0 to disable (bisect).
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    if let Some((collector, global_idx)) = ecdsa_collect {
+        if !std::env::var_os("BLVM_P2WPKH_SOA").is_some_and(|v| v == "0") {
+            let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+                der_sig,
+                strict_der,
+                enforce_low_s,
+            ) {
+                Some(c) => c,
+                None => return Ok(false),
+            };
+            let pk33 = match pubkey_bytes.len() {
+                33 => {
+                    let mut a = [0u8; 33];
+                    a.copy_from_slice(pubkey_bytes);
+                    a
+                }
+                65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                    Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                    None => return Ok(false),
+                },
+                _ => return Ok(false),
+            };
+            collector.collect_with_index(global_idx, &sighash, &pk33, &compact);
+            return Ok(true);
+        }
+    }
+
+    Ok(signature::with_secp_context(|secp| {
+        signature::verify_signature(
+            secp,
+            pubkey_bytes,
+            signature_bytes,
+            &sighash,
+            flags,
+            height,
+            network,
+            SigVersion::WitnessV0,
+        )
+    })
+    .unwrap_or(false))
+}
+
+/// P2WPKH-in-P2SH inline verify (BIP143). Caller must gate scriptPubKey / scriptSig / witness shape.
+#[cfg(feature = "production")]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn verify_p2wpkh_in_p2sh_inline(
+    script_sig: &[u8],
+    witness: &crate::witness::Witness,
+    script_pubkey: &[u8],
+    flags: u32,
+    tx: &Transaction,
+    input_index: usize,
+    prevout_value: i64,
+    height: u64,
+    network: crate::types::Network,
+    precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+) -> Result<bool> {
+    let expected_hash = &script_pubkey[2..22];
+    let pushes = match parse_script_sig_push_only(script_sig) {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    if pushes.len() != 1 {
+        return Ok(false);
+    }
+    let redeem = &pushes[0];
+    if redeem.len() != 22 || redeem[0] != OP_0 || redeem[1] != PUSH_20_BYTES {
+        return Ok(false);
+    }
+    let sha256_hash = OptimizedSha256::new().hash(redeem.as_ref());
+    let redeem_hash = Ripemd160::digest(sha256_hash);
+    if &redeem_hash[..] != expected_hash {
+        return Ok(false);
+    }
+
+    if witness.len() != 2 {
+        return Ok(false);
+    }
+    let signature_bytes = &witness[0];
+    let pubkey_bytes = &witness[1];
+    if (pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65) || signature_bytes.is_empty() {
+        return Ok(false);
+    }
+    let expected_pubkey_hash = &redeem[2..22];
+    let pubkey_sha256 = OptimizedSha256::new().hash(pubkey_bytes);
+    let pubkey_hash = Ripemd160::digest(pubkey_sha256);
+    if &pubkey_hash[..] != expected_pubkey_hash {
+        return Ok(false);
+    }
+
+    let p2pkh_script_code = bip143_p2wpkh_script_code(expected_pubkey_hash);
+    let sighash_byte = signature_bytes[signature_bytes.len() - 1];
+    let sighash = match crate::transaction_hash::calculate_bip143_sighash(
+        tx,
+        input_index,
+        &p2pkh_script_code,
+        prevout_value,
+        sighash_byte,
+        precomputed_bip143,
+    ) {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+
+    let der_sig = &signature_bytes[..signature_bytes.len() - 1];
+    let strict_der = flags & 0x04 != 0;
+    let enforce_low_s = flags & 0x08 != 0;
+
+    if strict_der
+        && !crate::bip_validation::check_bip66_network(signature_bytes, height, network)
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    if flags & 0x02 != 0 {
+        let sighash_base = sighash_byte & !0x80;
+        if !(0x01..=0x03).contains(&sighash_base) {
+            return Ok(false);
+        }
+        match pubkey_bytes.len() {
+            33 if pubkey_bytes[0] != 0x02 && pubkey_bytes[0] != 0x03 => return Ok(false),
+            65 if pubkey_bytes[0] != 0x04 => return Ok(false),
+            33 | 65 => {}
+            _ => return Ok(false),
+        }
+    }
+
+    // Nested P2WPKH SoA: same gate as native (BLVM_P2WPKH_SOA=0 disables).
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    if let Some((collector, global_idx)) = ecdsa_collect {
+        if !std::env::var_os("BLVM_P2WPKH_SOA").is_some_and(|v| v == "0") {
+            let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+                der_sig,
+                strict_der,
+                enforce_low_s,
+            ) {
+                Some(c) => c,
+                None => return Ok(false),
+            };
+            let pk33 = match pubkey_bytes.len() {
+                33 => {
+                    let mut a = [0u8; 33];
+                    a.copy_from_slice(pubkey_bytes);
+                    a
+                }
+                65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                    Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                    None => return Ok(false),
+                },
+                _ => return Ok(false),
+            };
+            collector.collect_with_index(global_idx, &sighash, &pk33, &compact);
+            return Ok(true);
+        }
+    }
+
+    Ok(signature::with_secp_context(|secp| {
+        signature::verify_signature(
+            secp,
+            pubkey_bytes,
+            signature_bytes,
+            &sighash,
+            flags,
+            height,
+            network,
+            SigVersion::WitnessV0,
+        )
+    })
+    .unwrap_or(false))
+}
+
 /// P2WPKH fast-path (SegWit P2PKH). ScriptPubKey OP_0 <20-byte-hash>, witness [sig, pubkey].
 /// Uses BIP143 sighash; skips interpreter. Returns None to fall back to full path.
 #[cfg(feature = "production")]
@@ -1870,7 +2442,10 @@ fn try_verify_p2wpkh_fast_path(
     network: crate::types::Network,
     precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
     #[cfg(feature = "production")] precomputed_sighash_all: Option<[u8; 32]>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
 ) -> Option<Result<bool>> {
+    let _ = prevout_script_pubkeys;
     // P2WPKH: 22 bytes = OP_0 PUSH_20_BYTES <20-byte-hash>
     if script_pubkey.len() != 22 || script_pubkey[0] != OP_0 || script_pubkey[1] != PUSH_20_BYTES {
         return None;
@@ -1882,90 +2457,22 @@ fn try_verify_p2wpkh_fast_path(
     if witness.len() != 2 {
         return None;
     }
-    let signature_bytes = &witness[0];
-    let pubkey_bytes = &witness[1];
-
-    if pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65 {
-        return Some(Ok(false));
-    }
-    if signature_bytes.is_empty() {
-        return Some(Ok(false));
-    }
-
-    let expected_hash = &script_pubkey[2..22];
-    let sha256_hash = OptimizedSha256::new().hash(pubkey_bytes);
-    let pubkey_hash = Ripemd160::digest(sha256_hash);
-    if &pubkey_hash[..] != expected_hash {
-        return Some(Ok(false));
-    }
-
-    // BIP143 §4.3: for P2WPKH the scriptCode is the P2PKH expansion, not the witness program.
-    let p2pkh_script_code = bip143_p2wpkh_script_code(expected_hash);
-
-    let sighash_byte = signature_bytes[signature_bytes.len() - 1];
-    let sighash = if sighash_byte == 0x01 {
-        // Roadmap #12: use precomputed SIGHASH_ALL when available
-        #[cfg(feature = "production")]
-        if let Some(precomp) = precomputed_sighash_all {
-            precomp
-        } else {
-            let amount = prevout_values.get(input_index).copied().unwrap_or(0);
-            match crate::transaction_hash::calculate_bip143_sighash(
-                tx,
-                input_index,
-                &p2pkh_script_code,
-                amount,
-                sighash_byte,
-                precomputed_bip143,
-            ) {
-                Ok(h) => h,
-                Err(e) => return Some(Err(e)),
-            }
-        }
-        #[cfg(not(feature = "production"))]
-        {
-            let amount = prevout_values.get(input_index).copied().unwrap_or(0);
-            match crate::transaction_hash::calculate_bip143_sighash(
-                tx,
-                input_index,
-                &p2pkh_script_code,
-                amount,
-                sighash_byte,
-                precomputed_bip143,
-            ) {
-                Ok(h) => h,
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    } else {
-        let amount = prevout_values.get(input_index).copied().unwrap_or(0);
-        match crate::transaction_hash::calculate_bip143_sighash(
-            tx,
-            input_index,
-            &p2pkh_script_code,
-            amount,
-            sighash_byte,
-            precomputed_bip143,
-        ) {
-            Ok(h) => h,
-            Err(e) => return Some(Err(e)),
-        }
-    };
-
     let height = block_height.unwrap_or(0);
-    let is_valid = signature::with_secp_context(|secp| {
-        signature::verify_signature(
-            secp,
-            pubkey_bytes,
-            signature_bytes,
-            &sighash,
-            flags,
-            height,
-            network,
-            SigVersion::WitnessV0,
-        )
-    });
-    Some(is_valid)
+    let prevout_value = prevout_values.get(input_index).copied().unwrap_or(0);
+    Some(verify_p2wpkh_inline(
+        witness,
+        script_pubkey,
+        flags,
+        tx,
+        input_index,
+        prevout_value,
+        height,
+        network,
+        precomputed_bip143,
+        precomputed_sighash_all,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        ecdsa_collect,
+    ))
 }
 
 /// P2WPKH-in-P2SH (nested SegWit). ScriptPubKey P2SH, scriptSig = \[redeem\], redeem = OP_0 + 20-byte pubkey hash, witness = \[sig, pubkey\].
@@ -1983,7 +2490,10 @@ fn try_verify_p2wpkh_in_p2sh_fast_path(
     block_height: Option<u64>,
     network: crate::types::Network,
     precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
 ) -> Option<Result<bool>> {
+    let _ = prevout_script_pubkeys;
     const SCRIPT_VERIFY_P2SH: u32 = 0x01;
     if (flags & SCRIPT_VERIFY_P2SH) == 0 {
         return None;
@@ -1995,8 +2505,12 @@ fn try_verify_p2wpkh_in_p2sh_fast_path(
     {
         return None;
     }
-    let expected_hash = &script_pubkey[2..22];
-
+    // P2WSH-in-P2SH also commonly has witness.len()==2 ([sig…, witnessScript]).
+    // Only claim nested P2WPKH when redeem is the 22-byte v0 program; otherwise None
+    // so the full P2SH/witness path runs (mainnet fail @497110 tx330 without this gate).
+    if witness.len() != 2 {
+        return None;
+    }
     let pushes = parse_script_sig_push_only(script_sig.as_ref())?;
     if pushes.len() != 1 {
         return None;
@@ -2005,65 +2519,29 @@ fn try_verify_p2wpkh_in_p2sh_fast_path(
     if redeem.len() != 22 || redeem[0] != OP_0 || redeem[1] != PUSH_20_BYTES {
         return None;
     }
-    let sha256_hash = OptimizedSha256::new().hash(redeem.as_ref());
-    let redeem_hash = Ripemd160::digest(sha256_hash);
-    if &redeem_hash[..] != expected_hash {
-        return Some(Ok(false));
-    }
-
-    if witness.len() != 2 {
-        return None;
-    }
-    let signature_bytes = &witness[0];
-    let pubkey_bytes = &witness[1];
-    if (pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65) || signature_bytes.is_empty() {
-        return Some(Ok(false));
-    }
-    let expected_pubkey_hash = &redeem[2..22];
-    let pubkey_sha256 = OptimizedSha256::new().hash(pubkey_bytes);
-    let pubkey_hash = Ripemd160::digest(pubkey_sha256);
-    if &pubkey_hash[..] != expected_pubkey_hash {
-        return Some(Ok(false));
-    }
-
-    // BIP143 §4.3: P2WPKH-in-P2SH scriptCode is the P2PKH expansion of the 20-byte program.
-    let p2pkh_script_code = bip143_p2wpkh_script_code(expected_pubkey_hash);
-
-    let sighash_byte = signature_bytes[signature_bytes.len() - 1];
-    let amount = prevout_values.get(input_index).copied().unwrap_or(0);
-    let sighash = match crate::transaction_hash::calculate_bip143_sighash(
+    let height = block_height.unwrap_or(0);
+    let prevout_value = prevout_values.get(input_index).copied().unwrap_or(0);
+    Some(verify_p2wpkh_in_p2sh_inline(
+        script_sig.as_ref(),
+        witness,
+        script_pubkey,
+        flags,
         tx,
         input_index,
-        &p2pkh_script_code,
-        amount,
-        sighash_byte,
+        prevout_value,
+        height,
+        network,
         precomputed_bip143,
-    ) {
-        Ok(h) => h,
-        Err(e) => return Some(Err(e)),
-    };
-
-    let height = block_height.unwrap_or(0);
-    let is_valid = signature::with_secp_context(|secp| {
-        signature::verify_signature(
-            secp,
-            pubkey_bytes,
-            signature_bytes,
-            &sighash,
-            flags,
-            height,
-            network,
-            SigVersion::WitnessV0,
-        )
-    });
-    Some(is_valid)
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        ecdsa_collect,
+    ))
 }
 
-/// P2WSH fast-path. ScriptPubKey OP_0 <32-byte-SHA256(witness_script)>; witness = [..., witness_script].
-/// Verifies hash then executes witness script only. Returns None to fall back to full path.
+/// P2WSH-in-P2SH (nested). scriptSig = \[redeem\], redeem = OP_0 + 32-byte program; then same as native P2WSH.
+/// Must run after nested-P2WPKH gate so 22-byte redeems are not claimed here.
 #[cfg(feature = "production")]
 #[allow(clippy::too_many_arguments)]
-fn try_verify_p2wsh_fast_path(
+pub(crate) fn try_verify_p2wsh_in_p2sh_fast_path(
     script_sig: &ByteString,
     script_pubkey: &[u8],
     witness: &crate::witness::Witness,
@@ -2080,6 +2558,80 @@ fn try_verify_p2wsh_fast_path(
     #[cfg(feature = "production")] sighash_cache: Option<
         &crate::transaction_hash::SighashMidstateCache,
     >,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
+) -> Option<Result<bool>> {
+    const SCRIPT_VERIFY_P2SH: u32 = 0x01;
+    if (flags & SCRIPT_VERIFY_P2SH) == 0 {
+        return None;
+    }
+    if script_pubkey.len() != 23
+        || script_pubkey[0] != OP_HASH160
+        || script_pubkey[1] != PUSH_20_BYTES
+        || script_pubkey[22] != OP_EQUAL
+    {
+        return None;
+    }
+    let pushes = parse_script_sig_push_only(script_sig.as_ref())?;
+    if pushes.len() != 1 {
+        return None;
+    }
+    let redeem = &pushes[0];
+    if redeem.len() != 34 || redeem[0] != OP_0 || redeem[1] != PUSH_32_BYTES {
+        return None;
+    }
+    let expected_hash = &script_pubkey[2..22];
+    let sha256_hash = OptimizedSha256::new().hash(redeem.as_ref());
+    let redeem_hash = Ripemd160::digest(sha256_hash);
+    if &redeem_hash[..] != expected_hash {
+        return Some(Ok(false));
+    }
+    // Native P2WSH path with empty scriptSig and redeem as the v0 program.
+    let empty_sig: ByteString = Vec::new();
+    try_verify_p2wsh_fast_path(
+        &empty_sig,
+        redeem.as_ref(),
+        witness,
+        flags,
+        tx,
+        input_index,
+        prevout_values,
+        prevout_script_pubkeys,
+        block_height,
+        median_time_past,
+        network,
+        schnorr_collector,
+        precomputed_bip143,
+        #[cfg(feature = "production")]
+        sighash_cache,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        ecdsa_collector,
+    )
+}
+
+/// P2WSH fast-path. ScriptPubKey OP_0 <32-byte-SHA256(witness_script)>; witness = [..., witness_script].
+/// Verifies hash then executes witness script only. Returns None to fall back to full path.
+#[cfg(feature = "production")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_verify_p2wsh_fast_path(
+    script_sig: &ByteString,
+    script_pubkey: &[u8],
+    witness: &crate::witness::Witness,
+    flags: u32,
+    tx: &Transaction,
+    input_index: usize,
+    prevout_values: &[i64],
+    prevout_script_pubkeys: &[&[u8]],
+    block_height: Option<u64>,
+    median_time_past: Option<u64>,
+    network: crate::types::Network,
+    schnorr_collector: Option<&crate::bip348::SchnorrSignatureCollector>,
+    precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
+    #[cfg(feature = "production")] sighash_cache: Option<
+        &crate::transaction_hash::SighashMidstateCache,
+    >,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
 ) -> Option<Result<bool>> {
     // P2WSH: 34 bytes = OP_0 PUSH_32_BYTES <32-byte-hash>
     if script_pubkey.len() != 34 || script_pubkey[0] != OP_0 || script_pubkey[1] != PUSH_32_BYTES {
@@ -2090,6 +2642,12 @@ fn try_verify_p2wsh_fast_path(
     }
     if witness.is_empty() {
         return None;
+    }
+    let max_witness_elem = MAX_SCRIPT_ELEMENT_SIZE;
+    for element in witness.iter().take(witness.len().saturating_sub(1)) {
+        if element.len() > max_witness_elem {
+            return Some(Ok(false));
+        }
     }
     let witness_script = witness.last().expect("witness not empty").clone();
     let mut stack: Vec<StackElement> = witness
@@ -2112,7 +2670,7 @@ fn try_verify_p2wsh_fast_path(
     // sigversion selector. Tapscript only applies inside Taproot script-path spends.
     let witness_sigversion = SigVersion::WitnessV0;
 
-    // P2WSH-with-P2PKH fast-path: witness_script = P2PKH, stack = [sig, pubkey]. BIP143, batch collect.
+    // P2WSH-with-P2PKH fast-path: witness_script = P2PKH, stack = [sig, pubkey]. BIP143 inline verify.
     if witness_sigversion == SigVersion::WitnessV0
         && witness_script.len() == 25
         && witness_script[0] == OP_DUP
@@ -2161,7 +2719,7 @@ fn try_verify_p2wsh_fast_path(
         }
     }
 
-    // P2WSH-with-P2PK fast-path: witness_script = OP_PUSHBYTES_N + pubkey + OP_CHECKSIG, stack = [sig]. BIP143, batch collect.
+    // P2WSH-with-P2PK fast-path: witness_script = OP_PUSHBYTES_N + pubkey + OP_CHECKSIG, stack = [sig]. BIP143 inline verify.
     if witness_sigversion == SigVersion::WitnessV0
         && (witness_script.len() == 35 || witness_script.len() == 67)
         && witness_script[witness_script.len() - 1] == OP_CHECKSIG
@@ -2203,7 +2761,8 @@ fn try_verify_p2wsh_fast_path(
         }
     }
 
-    // P2WSH-with-multisig fast-path: witness_script = OP_n <pubkeys> OP_m OP_CHECKMULTISIG, stack = [dummy, sig_1, ..., sig_m]. BIP143, BIP147 NULLDUMMY.
+    // P2WSH-with-multisig fast-path: witness_script = OP_n <pubkeys> OP_m OP_CHECKMULTISIG,
+    // stack = [dummy, sig_1, ..., sig_m]. BIP143 scriptCode = witness script (no FindAndDelete).
     if witness_sigversion == SigVersion::WitnessV0 {
         if let Some((m, _n, pubkeys)) = parse_redeem_multisig(witness_script.as_ref()) {
             if stack.len() < 2 {
@@ -2226,15 +2785,85 @@ fn try_verify_p2wsh_fast_path(
                 }
             }
 
-            let mut cleaned = witness_script.to_vec();
-            for sig in &signatures {
-                if !sig.is_empty() {
-                    let pattern = serialize_push_data(sig);
-                    cleaned = find_and_delete(&cleaned, &pattern).into_owned();
+            // WitnessV0 (BIP143): scriptCode is the witness script; no FindAndDelete.
+            let script_code = witness_script.as_ref();
+            let amount = prevout_values.get(input_index).copied().unwrap_or(0);
+
+            // IBD deferral: cartesian oracle → SoA/GPU; Core match + NULLFAIL at block end.
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            if let Some(collector) = ecdsa_collector {
+                let nullfail = (flags & SCRIPT_VERIFY_NULLFAIL) != 0;
+                let enforce_low_s = (flags & flags::SCRIPT_VERIFY_LOW_S) != 0;
+                let strict_der = (flags & flags::SCRIPT_VERIFY_DERSIG) != 0
+                    || (flags & flags::SCRIPT_VERIFY_STRICTENC) != 0
+                    || (flags & flags::SCRIPT_VERIFY_LOW_S) != 0;
+                let mut trial_indices = Vec::new();
+                let mut sig_empty = Vec::with_capacity(signatures.len());
+                // Reuse BIP143 sighash when multiple sigs share sighash byte (common m-of-n).
+                let mut sighash_by_type: Vec<(u8, [u8; 32])> = Vec::new();
+                for sig_bytes in &signatures {
+                    if sig_bytes.is_empty() {
+                        sig_empty.push(true);
+                        continue;
+                    }
+                    sig_empty.push(false);
+                    let sighash_byte = sig_bytes[sig_bytes.len() - 1];
+                    let sighash = if let Some((_, h)) =
+                        sighash_by_type.iter().find(|(b, _)| *b == sighash_byte)
+                    {
+                        *h
+                    } else {
+                        let h = match crate::transaction_hash::calculate_bip143_sighash(
+                            tx,
+                            input_index,
+                            script_code,
+                            amount,
+                            sighash_byte,
+                            precomputed_bip143,
+                        ) {
+                            Ok(h) => h,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        sighash_by_type.push((sighash_byte, h));
+                        h
+                    };
+                    let der_sig = &sig_bytes[..sig_bytes.len() - 1];
+                    let compact = blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
+                        der_sig, strict_der, enforce_low_s,
+                    );
+                    for pubkey_bytes in &pubkeys {
+                        let gidx = collector.alloc_multisig_trial_index();
+                        trial_indices.push(gidx);
+                        let Some(compact) = compact.as_ref() else {
+                            continue;
+                        };
+                        let pk33 = match pubkey_bytes.len() {
+                            33 => {
+                                let mut a = [0u8; 33];
+                                a.copy_from_slice(pubkey_bytes);
+                                a
+                            }
+                            65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                                Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                                None => continue,
+                            },
+                            _ => continue,
+                        };
+                        collector.collect_with_index(gidx, &sighash, &pk33, compact);
+                    }
                 }
+                collector.push_multisig_pending(crate::ecdsa_batch::MultisigPending {
+                    m,
+                    n_pubs: pubkeys.len(),
+                    trial_indices,
+                    sig_empty,
+                    nullfail,
+                });
+                #[cfg(feature = "profile")]
+                crate::script_profile::note_arm_p2sh_multisig(0);
+                return Some(Ok(true));
             }
 
-            let amount = prevout_values.get(input_index).copied().unwrap_or(0);
             let mut sig_index = 0;
             let mut valid_sigs = 0u8;
 
@@ -2253,7 +2882,7 @@ fn try_verify_p2wsh_fast_path(
                 match crate::transaction_hash::calculate_bip143_sighash(
                     tx,
                     input_index,
-                    &cleaned,
+                    script_code,
                     amount,
                     sighash_byte,
                     precomputed_bip143,
@@ -2498,6 +3127,8 @@ pub fn verify_script_with_context_full(
         &crate::transaction_hash::SighashMidstateCache,
     >,
     #[cfg(feature = "production")] precomputed_p2pkh_hash: Option<[u8; 20]>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
 ) -> Result<bool> {
     // libbitcoin-consensus check (multi-input verify_script): prevouts length must match vin size
     if prevout_values.len() != tx.inputs.len() || prevout_script_pubkeys.len() != tx.inputs.len() {
@@ -2616,6 +3247,8 @@ pub fn verify_script_with_context_full(
             sighash_cache,
             #[cfg(feature = "production")]
             precomputed_sighash_all,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            ecdsa_collect,
         ) {
             FAST_PATH_P2SH.fetch_add(1, Ordering::Relaxed);
             return result;
@@ -2653,8 +3286,32 @@ pub fn verify_script_with_context_full(
                 block_height,
                 network,
                 precomputed_bip143,
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                ecdsa_collect,
             ) {
                 FAST_PATH_P2WPKH.fetch_add(1, Ordering::Relaxed);
+                return result;
+            }
+            if let Some(result) = try_verify_p2wsh_in_p2sh_fast_path(
+                script_sig,
+                script_pubkey,
+                wit,
+                flags,
+                tx,
+                input_index,
+                prevout_values,
+                prevout_script_pubkeys,
+                block_height,
+                median_time_past,
+                network,
+                schnorr_collector,
+                precomputed_bip143,
+                #[cfg(feature = "production")]
+                sighash_cache,
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                ecdsa_collect.map(|(c, _)| c),
+            ) {
+                FAST_PATH_P2WSH.fetch_add(1, Ordering::Relaxed);
                 return result;
             }
             if let Some(result) = try_verify_p2wpkh_fast_path(
@@ -2670,6 +3327,8 @@ pub fn verify_script_with_context_full(
                 network,
                 precomputed_bip143,
                 precomputed_sighash_all,
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                ecdsa_collect,
             ) {
                 FAST_PATH_P2WPKH.fetch_add(1, Ordering::Relaxed);
                 return result;
@@ -2690,6 +3349,8 @@ pub fn verify_script_with_context_full(
                 precomputed_bip143,
                 #[cfg(feature = "production")]
                 sighash_cache,
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                ecdsa_collect.map(|(c, _)| c),
             ) {
                 FAST_PATH_P2WSH.fetch_add(1, Ordering::Relaxed);
                 return result;
@@ -2822,6 +3483,8 @@ pub fn verify_script_with_context_full(
                 network,
                 #[cfg(feature = "production")]
                 sighash_cache,
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                ecdsa_collect.map(|(c, _)| c),
             ) {
                 return result;
             }
@@ -2875,6 +3538,13 @@ pub fn verify_script_with_context_full(
             && ((redeem[1] == PUSH_20_BYTES && redeem.len() == 22)
                 || (redeem[1] == PUSH_32_BYTES && redeem.len() == 34))
     });
+    // BIP141: nested P2WPKH/P2WSH scriptSig must be exactly one push of the redeem.
+    if nested_witness_program {
+        match parse_script_sig_push_only(script_sig.as_ref()) {
+            Some(items) if items.len() == 1 => {}
+            _ => return Ok(false),
+        }
+    }
 
     // CRITICAL FIX: Check if scriptPubkey is Taproot (P2TR) - OP_1 <32-byte-hash>
     // Taproot format: [OP_1, PUSH_32_BYTES, <32 bytes>] = 34 bytes total
@@ -2889,6 +3559,26 @@ pub fn verify_script_with_context_full(
     // If Taproot, scriptSig must be empty
     if is_taproot && !script_sig.is_empty() {
         return Ok(false); // Taproot requires empty scriptSig
+    }
+
+    // Future / non-standard witness programs (BIP141 §2; discourage-upgradable-witness).
+    if redeem_script.is_none()
+        && !is_taproot
+        && crate::witness::is_upgradable_witness_program(script_pubkey)
+    {
+        use crate::script::flags::{
+            SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, SCRIPT_VERIFY_WITNESS,
+        };
+        if !script_sig.is_empty() {
+            return Ok(false);
+        }
+        if (flags & SCRIPT_VERIFY_WITNESS) == 0 {
+            return Ok(false);
+        }
+        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) != 0 {
+            return Ok(false);
+        }
+        return Ok(true);
     }
 
     // CRITICAL FIX: Check if scriptPubkey is a direct witness program (P2WPKH or P2WSH, not nested in P2SH)
@@ -2928,7 +3618,11 @@ pub fn verify_script_with_context_full(
                 }
 
                 // Hash matches - push witness stack elements (except last) onto stack
+                let max_witness_elem = MAX_SCRIPT_ELEMENT_SIZE;
                 for element in witness_stack.iter().take(witness_stack.len() - 1) {
+                    if element.len() > max_witness_elem {
+                        return Ok(false);
+                    }
                     stack.push(to_stack_element(element));
                 }
 
@@ -2941,7 +3635,11 @@ pub fn verify_script_with_context_full(
                     return Ok(false); // P2WPKH requires exactly 2 witness elements
                 }
 
+                let max_witness_elem = MAX_SCRIPT_ELEMENT_SIZE;
                 for element in witness_stack.iter() {
+                    if element.len() > max_witness_elem {
+                        return Ok(false);
+                    }
                     stack.push(to_stack_element(element));
                 }
             } else {
@@ -2989,8 +3687,19 @@ pub fn verify_script_with_context_full(
         output_key.copy_from_slice(&script_pubkey[2..34]);
         match crate::taproot::parse_taproot_script_path_witness(&witness_body, &output_key)? {
             None => return Ok(false),
-            Some((tapscript, stack_items, _control_block)) => {
+            Some((tapscript, stack_items, control_block)) => {
+                if control_block.leaf_version != crate::taproot::TAPROOT_LEAF_VERSION_TAPSCRIPT {
+                    use crate::script::flags::SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
+                    if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION != 0 {
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
+                let max_witness_elem = MAX_SCRIPT_ELEMENT_SIZE;
                 for item in &stack_items {
+                    if item.len() > max_witness_elem {
+                        return Ok(false);
+                    }
                     stack.push(to_stack_element(item));
                 }
                 let tapscript_flags = flags | 0x8000;
@@ -3154,7 +3863,11 @@ pub fn verify_script_with_context_full(
 
                     // Push all witness stack elements except the last one (witness script) onto the stack
                     // These are the signatures and other data needed for witness script execution
+                    let max_witness_elem = MAX_SCRIPT_ELEMENT_SIZE;
                     for element in witness_stack.iter().take(witness_stack.len() - 1) {
+                        if element.len() > max_witness_elem {
+                            return Ok(false);
+                        }
                         stack.push(to_stack_element(element));
                     }
 
@@ -3587,6 +4300,18 @@ fn eval_script_with_context_full_inner(
 
             // Only push data if not in a non-executing branch
             if !in_false_branch {
+                let max_element = MAX_SCRIPT_ELEMENT_SIZE;
+                if data.len() > max_element {
+                    return Err(ConsensusError::ScriptErrorWithCode {
+                        code: ScriptErrorCode::PushSize,
+                        message: format!(
+                            "Push data size {} exceeds maximum {}",
+                            data.len(),
+                            max_element
+                        )
+                        .into(),
+                    });
+                }
                 stack.push(to_stack_element(data));
             }
             i += advance;
@@ -4999,51 +5724,184 @@ fn parse_p2sh_script_sig_pushes(script_sig: &[u8]) -> Option<Vec<StackElement>> 
     parse_script_sig_push_only(script_sig)
 }
 
-/// Parse redeem script as `OP_n <pubkeys> OP_m OP_CHECKMULTISIG`.
-/// Format: first byte OP_1..OP_16 = n, then n pubkeys (33 or 65 bytes each),
-/// then OP_1..OP_16 = m, then 0xae (OP_CHECKMULTISIG).
-/// Returns (m, n, pubkey_slices) or None if format doesn't match.
+/// Parse redeem script as `OP_m <pubkeys> OP_n OP_CHECKMULTISIG` (Bitcoin standard).
+///
+/// `m` = required signatures (threshold), `n` = pubkey count. Standard mainnet
+/// form uses push opcodes before each key (`PUSH_33_BYTES` / `PUSH_65_BYTES`).
+/// Also accepts legacy raw-key form (SEC header, no push length) for tests.
+///
+/// Returns `(m, n, pubkey_slices)` or `None` if the format doesn't match.
 fn parse_redeem_multisig(redeem: &[u8]) -> Option<(u8, u8, Vec<&[u8]>)> {
     if redeem.len() < 4 {
         return None;
     }
-    let n_op = redeem[0];
+    // Trailer: OP_n OP_CHECKMULTISIG
+    if redeem[redeem.len() - 1] != OP_CHECKMULTISIG {
+        return None;
+    }
+    let n_op = redeem[redeem.len() - 2];
     if !(OP_1..=OP_16).contains(&n_op) {
         return None;
     }
     let n = (n_op - OP_1 + 1) as usize;
-    let mut i = 1;
-    let mut pubkeys = Vec::with_capacity(n);
-    for _ in 0..n {
-        if i >= redeem.len() {
-            return None;
-        }
-        let first = redeem[i];
-        let pk_len = if first == 0x02 || first == 0x03 {
-            33
-        } else if first == 0x04 {
-            65
-        } else {
-            return None;
-        };
-        if i + pk_len > redeem.len() {
-            return None;
-        }
-        pubkeys.push(&redeem[i..i + pk_len]);
-        i += pk_len;
-    }
-    if i + 2 > redeem.len() {
-        return None;
-    }
-    let m_op = redeem[i];
+    let m_op = redeem[0];
     if !(OP_1..=OP_16).contains(&m_op) {
         return None;
     }
     let m = m_op - OP_1 + 1;
-    if redeem[i + 1] != OP_CHECKMULTISIG {
+    if (m as usize) > n || m == 0 {
+        return None;
+    }
+    let mut i = 1;
+    let mut pubkeys = Vec::with_capacity(n);
+    for _ in 0..n {
+        if i >= redeem.len().saturating_sub(2) {
+            return None;
+        }
+        let first = redeem[i];
+        // Push-encoded compressed/uncompressed — standard mainnet redeem.
+        // Also accept legacy raw-key form (SEC header with no push length) for tests.
+        let (pk_start, pk_len) = if first == PUSH_33_BYTES {
+            (i + 1, 33usize)
+        } else if first == PUSH_65_BYTES {
+            (i + 1, 65usize)
+        } else if first == 0x02 || first == 0x03 {
+            (i, 33usize)
+        } else if first == 0x04 {
+            (i, 65usize)
+        } else {
+            return None;
+        };
+        if pk_start + pk_len > redeem.len().saturating_sub(2) {
+            return None;
+        }
+        let pk = &redeem[pk_start..pk_start + pk_len];
+        let hdr = pk[0];
+        if !(hdr == 0x02 || hdr == 0x03 || hdr == 0x04) {
+            return None;
+        }
+        if (hdr == 0x02 || hdr == 0x03) && pk_len != 33 {
+            return None;
+        }
+        if hdr == 0x04 && pk_len != 65 {
+            return None;
+        }
+        pubkeys.push(pk);
+        i = pk_start + pk_len;
+    }
+    // Must land exactly on OP_n OP_CHECKMULTISIG.
+    if i != redeem.len() - 2 {
         return None;
     }
     Some((m, n as u8, pubkeys))
+}
+
+#[cfg(test)]
+mod parse_redeem_multisig_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_push_encoded_compressed_2of3() {
+        // Standard: OP_m <pks> OP_n OP_CHECKMULTISIG  →  2-of-3
+        let mut redeem = vec![OP_2];
+        for i in 0..3u8 {
+            redeem.push(PUSH_33_BYTES);
+            let mut pk = [0u8; 33];
+            pk[0] = 0x02;
+            pk[1] = i + 1;
+            redeem.extend_from_slice(&pk);
+        }
+        redeem.push(OP_3);
+        redeem.push(OP_CHECKMULTISIG);
+        let (m, n, pks) = parse_redeem_multisig(&redeem).expect("push-encoded redeem");
+        assert_eq!(m, 2);
+        assert_eq!(n, 3);
+        assert_eq!(pks.len(), 3);
+        assert_eq!(pks[0][0], 0x02);
+    }
+
+    #[test]
+    fn accepts_legacy_raw_key_form() {
+        // 1-of-1 raw key: OP_1 <33-byte-pk> OP_1 OP_CHECKMULTISIG
+        let mut redeem = vec![OP_1];
+        let mut pk = [0u8; 33];
+        pk[0] = 0x03;
+        pk[2] = 0xaa;
+        redeem.extend_from_slice(&pk);
+        redeem.push(OP_1);
+        redeem.push(OP_CHECKMULTISIG);
+        let (m, n, pks) = parse_redeem_multisig(&redeem).expect("raw-key redeem");
+        assert_eq!((m, n, pks.len()), (1, 1, 1));
+    }
+
+    #[test]
+    fn rejects_trailing_opcodes() {
+        let mut redeem = vec![OP_1, PUSH_33_BYTES];
+        let mut pk = [0u8; 33];
+        pk[0] = 0x02;
+        redeem.extend_from_slice(&pk);
+        redeem.push(OP_1);
+        redeem.push(OP_CHECKMULTISIG);
+        redeem.push(OP_DROP);
+        assert!(parse_redeem_multisig(&redeem).is_none());
+    }
+
+    /// Regression: P2WSH-in-P2SH (wit.len()==2) must not be claimed as nested P2WPKH.
+    /// Mainnet height 497110 tx330 failed when the dens path returned Ok(false) instead of None.
+    #[cfg(feature = "production")]
+    #[test]
+    fn nested_p2wsh_not_claimed_as_p2wpkh_in_p2sh() {
+        use crate::types::{OutPoint, Transaction, TransactionInput};
+        // scriptSig = push(34) ‖ OP_0 ‖ PUSH_32 ‖ <32-byte program>  (nested P2WSH)
+        let mut program = [0u8; 32];
+        program[0] = 0x50;
+        let mut script_sig = vec![34u8, OP_0, PUSH_32_BYTES];
+        script_sig.extend_from_slice(&program);
+        let script_pubkey = {
+            let h = Ripemd160::digest(OptimizedSha256::new().hash(&script_sig[1..]));
+            let mut spk = vec![OP_HASH160, PUSH_20_BYTES];
+            spk.extend_from_slice(&h);
+            spk.push(OP_EQUAL);
+            spk
+        };
+        // Minimal fake witness [sig, witnessScript] — shape only; fast path must return None
+        // before verifying (redeem is not 22-byte P2WPKH).
+        let witness: crate::witness::Witness = vec![vec![0u8; 72], vec![OP_1, OP_1]];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TransactionInput {
+                prevout: OutPoint {
+                    hash: [0u8; 32],
+                    index: 0,
+                },
+                sequence: 0xffff_ffff,
+                script_sig: script_sig.clone(),
+            }]
+            .into(),
+            outputs: vec![].into(),
+            lock_time: 0,
+        };
+        let result = try_verify_p2wpkh_in_p2sh_fast_path(
+            &script_sig,
+            &script_pubkey,
+            &witness,
+            0x01, // P2SH
+            &tx,
+            0,
+            &[0i64],
+            &[],
+            Some(497_110),
+            crate::types::Network::Mainnet,
+            None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
+        );
+        assert!(
+            result.is_none(),
+            "nested P2WSH must fall through, got {:?}",
+            result
+        );
+    }
 }
 
 /// Map OP_1NEGATE..OP_16 to numeric value for script_num_to_bytes
@@ -5824,10 +6682,14 @@ fn execute_opcode_with_context_full(
                 };
                 let mut cleaned = base_script.to_vec();
                 for sig in &signatures {
-                    if !sig.is_empty() {
-                        let pattern = serialize_push_data(sig.as_ref());
-                        cleaned = find_and_delete(&cleaned, &pattern).into_owned();
+                    if sig.is_empty() {
+                        continue;
                     }
+                    if sig.len().saturating_add(1) > cleaned.len() {
+                        continue;
+                    }
+                    let pattern = serialize_push_data(sig.as_ref());
+                    cleaned = find_and_delete(&cleaned, &pattern).into_owned();
                 }
                 cleaned
             } else {
@@ -6239,7 +7101,8 @@ fn execute_opcode_with_context_full(
         //
         // Behavior must match consensus (BIP65/112):
         // - If SCRIPT_VERIFY_CHECKSEQUENCEVERIFY flag is not set, behaves as a NOP (no-op)
-        // - If sequence has the disable flag set (0x80000000), behaves as a NOP
+        // - If the *stack* sequence has the disable flag set (0x80000000), behaves as a NOP
+        // - If the *input* nSequence disable flag is set (and stack is not disabled), fail
         // - Does NOT remove the top stack item on success (non-consuming)
         OP_CHECKSEQUENCEVERIFY => {
             use crate::locktime::{
@@ -6271,9 +7134,12 @@ fn execute_opcode_with_context_full(
             }
             let input_sequence = tx.inputs[input_index].sequence as u32;
 
-            // BIP112/BIP68: If sequence has the disable flag set, CSV behaves as a NOP
-            if is_sequence_disabled(input_sequence) {
+            // BIP112: stack disable flag → NOP. Input disable flag → fail.
+            if is_sequence_disabled(sequence_value) {
                 return Ok(true);
+            }
+            if is_sequence_disabled(input_sequence) {
+                return Ok(false);
             }
 
             // BIP68: Extract relative locktime type and value using shared logic
@@ -7510,6 +8376,8 @@ mod tests {
             None,
             #[cfg(feature = "production")]
             None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
         );
         assert!(result.is_ok());
         assert!(!result.unwrap());
@@ -7551,6 +8419,8 @@ mod tests {
             None,
             #[cfg(feature = "production")]
             None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
         );
         assert!(result.is_ok());
         assert!(!result.unwrap());
@@ -7586,6 +8456,8 @@ mod tests {
             #[cfg(feature = "production")]
             None,
             #[cfg(feature = "production")]
+            None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
             None,
         );
         assert!(result.is_ok());
@@ -7623,6 +8495,8 @@ mod tests {
             #[cfg(feature = "production")]
             None,
             #[cfg(feature = "production")]
+            None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
             None,
         );
         assert!(result.is_ok());
@@ -7679,6 +8553,8 @@ mod tests {
             #[cfg(feature = "production")]
             None,
             #[cfg(feature = "production")]
+            None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
             None,
         );
         assert!(result.is_ok());

@@ -2,9 +2,11 @@
 
 use crate::error::{ConsensusError, Result};
 use crate::types::Hash;
-use blvm_secp256k1::ecdsa::{ecdsa_sig_parse_compact, ecdsa_sig_verify, ge_from_compressed};
+use blvm_secp256k1::ecdsa::{
+    ecdsa_sig_parse_compact, ecdsa_sig_verify, ecdsa_verify_batch_results, ge_from_compressed,
+};
 use blvm_secp256k1::scalar::Scalar;
-use blvm_secp256k1::schnorr::{schnorr_verify, schnorr_verify_batch};
+use blvm_secp256k1::schnorr::{schnorr_verify, schnorr_verify_batch_results};
 use blvm_secp256k1::taproot::taproot_output_key as blvm_taproot_output_key;
 
 pub fn verify_ecdsa(
@@ -34,20 +36,16 @@ pub fn verify_schnorr_batch(
     msgs: &[&[u8]],
     pubkeys: &[[u8; 32]],
 ) -> Result<Vec<bool>> {
-    let n = sigs.len().min(msgs.len()).min(pubkeys.len());
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let ok = schnorr_verify_batch(sigs, msgs, pubkeys);
-    if ok {
-        Ok(vec![true; n])
-    } else {
-        let mut results = Vec::with_capacity(n);
-        for i in 0..n {
-            results.push(schnorr_verify(&sigs[i], msgs[i], &pubkeys[i]));
-        }
-        Ok(results)
-    }
+    Ok(schnorr_verify_batch_results(sigs, msgs, pubkeys))
+}
+
+/// ECDSA batch verify: one result per signature (GPU when `blvm-secp256k1/gpu` is on).
+pub fn verify_ecdsa_batch(
+    sigs: &[[u8; 64]],
+    msgs: &[[u8; 32]],
+    pubkeys: &[[u8; 33]],
+) -> Result<Vec<bool>> {
+    Ok(ecdsa_verify_batch_results(sigs, msgs, pubkeys))
 }
 
 pub fn taproot_output_key(internal_pubkey: &[u8; 32], merkle_root: &Hash) -> Result<[u8; 32]> {

@@ -47,6 +47,8 @@ pub struct ScriptCheck {
     pub spk_offset: u32,
     pub spk_len: u32,
     pub prevout_value: i64,
+    /// Per-input verify flags.
+    pub flags: u32,
 }
 
 /// Per-tx context shared by all inputs of that tx.
@@ -89,6 +91,9 @@ pub struct BlockSessionContext {
     pub ecdsa_sub_counters: Arc<Vec<AtomicUsize>>,
     #[cfg(feature = "production")]
     pub schnorr_collector: Option<Arc<crate::bip348::SchnorrSignatureCollector>>,
+    /// When set, P2PKH fast path defers secp to block-end ECDSA batch (CPU / GPU).
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+    pub ecdsa_collector: Option<Arc<crate::ecdsa_batch::EcdsaSignatureCollector>>,
     pub height: Natural,
     pub median_time_past: Option<u64>,
     pub network: Network,
@@ -214,6 +219,11 @@ impl ScriptCheckQueue {
         };
         let ecdsa_global_idx = ctx.ecdsa_index_base + check.input_idx;
 
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        let ecdsa_collect = session.ecdsa_collector.as_ref().map(|col| {
+            (col.as_ref(), ecdsa_global_idx)
+        });
+
         #[cfg(feature = "production")]
         let sighash_cache = ctx.sighash_midstate_cache.as_ref();
 
@@ -236,7 +246,7 @@ impl ScriptCheckQueue {
                 &tx.inputs[check.input_idx].script_sig,
                 script_pubkey,
                 witness_for_script,
-                ctx.flags,
+                check.flags,
                 tx,
                 check.input_idx,
                 prevout_values,
@@ -259,6 +269,8 @@ impl ScriptCheckQueue {
                 sighash_cache,
                 #[cfg(feature = "production")]
                 precomputed_p2pkh,
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                ecdsa_collect,
             )
             .map_err(|e| {
                 ConsensusError::BlockValidation(

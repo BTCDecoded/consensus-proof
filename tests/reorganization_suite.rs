@@ -434,6 +434,7 @@ fn reorganize_chain_simple(
         None::<fn(&Hash, &BlockUndoLog) -> blvm_consensus::error::Result<()>>,
         TEST_NETWORK_TIME,
         Network::Regtest,
+        None,
     )
 }
 
@@ -456,6 +457,7 @@ fn test_reorganize_chain_with_witnesses_extends_regtest() {
         Some(noop_put_undo),
         TEST_NETWORK_TIME,
         Network::Regtest,
+        None,
     )
     .unwrap();
 
@@ -492,6 +494,7 @@ fn test_reorganize_chain_with_witnesses_uses_undo_callbacks() {
         Some(put_undo),
         TEST_NETWORK_TIME,
         Network::Regtest,
+        None,
     )
     .unwrap();
 
@@ -518,6 +521,7 @@ fn test_reorganize_chain_with_witnesses_rejects_witness_block_mismatch() {
         None::<fn(&Hash, &BlockUndoLog) -> blvm_consensus::error::Result<()>>,
         TEST_NETWORK_TIME,
         Network::Regtest,
+        None,
     );
 }
 
@@ -703,6 +707,7 @@ fn test_reorganize_fork_disconnects_tip_with_undo_logs() {
         Some(put_undo),
         TEST_NETWORK_TIME,
         Network::Regtest,
+        None,
     )
     .unwrap();
 

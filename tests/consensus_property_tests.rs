@@ -1077,6 +1077,7 @@ proptest! {
             None::<fn(&Hash, &blvm_consensus::reorganization::BlockUndoLog) -> blvm_consensus::error::Result<()>>,
             network_time,
             blvm_consensus::types::Network::Regtest,
+            None,
         );
 
         if let Ok(reorg_result) = result {
@@ -1317,6 +1318,7 @@ proptest! {
                 None::<fn(&Hash, &blvm_consensus::reorganization::BlockUndoLog) -> blvm_consensus::error::Result<()>>,
                 network_time,
                 blvm_consensus::types::Network::Regtest,
+                None,
             );
 
             // After reorganizing to the same chain, state should be preserved
@@ -1966,13 +1968,15 @@ proptest! {
     ///
     /// Mathematical specification:
     /// ∀ tx ∈ Transaction, utxo_set ∈ UtxoSet:
-    ///   If input.prevout ∉ utxo_set: calculate_fee treats missing UTXO as value 0
+    ///   If input.prevout ∉ utxo_set: calculate_fee returns UtxoNotFound
+    ///   (coinbase → Ok(0); empty inputs non-coinbase still walks zero inputs → Ok(0))
     #[test]
     fn prop_calculate_fee_missing_utxo_handling(
         input_count in 0usize..5usize,
         output_count in 0usize..5usize
     ) {
         use blvm_consensus::economic;
+        use blvm_consensus::error::ConsensusError;
         use blvm_consensus::types::*;
 
         // Create transaction with inputs that may not be in UTXO set
@@ -1998,18 +2002,21 @@ proptest! {
 
         let result = economic::calculate_fee(&tx, &utxo_set);
 
-        // Missing UTXOs are treated as value 0
-        // If outputs > 0, fee will be negative (error)
-        // If outputs = 0, fee will be 0 (success)
-        if output_count == 0 && input_count > 0 {
-            // All inputs missing, no outputs: fee = 0
-            prop_assert!(result.is_ok(), "Fee calculation should succeed with missing UTXOs and no outputs");
-            if let Ok(fee) = result {
-                prop_assert_eq!(fee, 0, "Fee should be 0 when all inputs are missing and no outputs");
+        if input_count == 0 {
+            // Empty inputs (not a coinbase null-prevout): fee = 0 - outputs.
+            if output_count == 0 {
+                prop_assert!(result.is_ok(), "Empty tx fee should be Ok(0)");
+            } else {
+                prop_assert!(
+                    matches!(result, Err(ConsensusError::EconomicValidation(_))),
+                    "Empty inputs with outputs → negative fee, got {result:?}"
+                );
             }
-        } else if output_count > 0 {
-            // Missing UTXOs with outputs: negative fee (error)
-            prop_assert!(result.is_err(), "Fee calculation should fail with missing UTXOs and outputs");
+        } else {
+            prop_assert!(
+                matches!(result, Err(ConsensusError::UtxoNotFound(_))),
+                "Missing UTXO must be UtxoNotFound, got {result:?}"
+            );
         }
     }
 

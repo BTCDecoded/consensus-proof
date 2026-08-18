@@ -125,12 +125,12 @@ impl UtxoLookup for UtxoSet {
 
 /// Zero-copy overlay for UTXO set modifications during block validation.
 ///
-/// Provides a view over the base UTXO set that captures additions and deletions
+/// Provides a view over any [`UtxoLookup`] base that captures additions and deletions
 /// without copying the underlying data.
 #[derive(Debug)]
-pub struct UtxoOverlay<'a> {
-    /// Reference to the base UTXO set (read-only)
-    base: &'a UtxoSet,
+pub struct UtxoOverlay<'a, B: UtxoLookup + ?Sized = UtxoSet> {
+    /// Reference to the base UTXO view (read-only)
+    base: &'a B,
     /// UTXOs added in this overlay (new outputs from current block)
     additions: FxHashMap<OutPoint, std::sync::Arc<UTXO>>,
     /// UTXOs marked as spent in this overlay (OutPointKey to avoid clone in remove hot path)
@@ -139,12 +139,12 @@ pub struct UtxoOverlay<'a> {
     has_deletions: bool,
 }
 
-impl<'a> UtxoOverlay<'a> {
-    /// Create a new overlay over the given UTXO set.
+impl<'a, B: UtxoLookup + ?Sized> UtxoOverlay<'a, B> {
+    /// Create a new overlay over the given UTXO view.
     ///
     /// This is O(1) - no copying of the base set.
     #[inline]
-    pub fn new(base: &'a UtxoSet) -> Self {
+    pub fn new(base: &'a B) -> Self {
         Self {
             base,
             // Pre-allocate for typical block size (~3000 transactions)
@@ -156,7 +156,7 @@ impl<'a> UtxoOverlay<'a> {
 
     /// Create a new overlay with custom capacity hints.
     #[inline]
-    pub fn with_capacity(base: &'a UtxoSet, additions_cap: usize, deletions_cap: usize) -> Self {
+    pub fn with_capacity(base: &'a B, additions_cap: usize, deletions_cap: usize) -> Self {
         Self {
             base,
             additions: FxHashMap::with_capacity_and_hasher(additions_cap, Default::default()),
@@ -179,8 +179,8 @@ impl<'a> UtxoOverlay<'a> {
             return Some(arc.as_ref());
         }
 
-        // Fall back to base set (UtxoSet holds Arc<UTXO>; deref to &UTXO)
-        self.base.get(outpoint).map(|a| a.as_ref())
+        // Fall back to base view
+        self.base.get(outpoint)
     }
 
     /// Check if a UTXO exists.
@@ -233,11 +233,11 @@ impl<'a> UtxoOverlay<'a> {
         if let Some(arc) = self.additions.remove(outpoint) {
             return Some(arc);
         }
-        // Mark as deleted from base set (base holds Arc<UTXO>; share Arc for undo)
-        if let Some(arc) = self.base.get(outpoint) {
+        // Mark as deleted from base view
+        if let Some(utxo) = self.base.get(outpoint) {
             self.deletions.insert(outpoint_to_key(outpoint));
             self.has_deletions = true;
-            return Some(std::sync::Arc::clone(arc));
+            return Some(std::sync::Arc::new(utxo.clone()));
         }
 
         None
@@ -255,25 +255,10 @@ impl<'a> UtxoOverlay<'a> {
         self.deletions.len()
     }
 
-    /// Get the size of the base UTXO set.
+    /// Get the size of the base UTXO view.
     #[inline]
     pub fn base_len(&self) -> usize {
         self.base.len()
-    }
-
-    /// Apply the overlay changes to produce a new UTXO set.
-    ///
-    /// This is called at the end of successful block validation.
-    /// Base clone is cheap (Arc refcount only); additions wrapped in Arc.
-    pub fn apply_to_base(self) -> UtxoSet {
-        let mut result = self.base.clone();
-        for key in self.deletions {
-            result.remove(&key_to_outpoint(&key));
-        }
-        for (outpoint, arc) in self.additions {
-            result.insert(outpoint, arc);
-        }
-        result
     }
 
     /// Get immutable access to additions (for undo log generation).
@@ -306,8 +291,23 @@ impl<'a> UtxoOverlay<'a> {
     }
 }
 
+/// `UtxoSet`-specific helpers (clone/apply require owned HashMap base).
+impl<'a> UtxoOverlay<'a, UtxoSet> {
+    /// Apply the overlay changes to produce a new UTXO set.
+    pub fn apply_to_base(self) -> UtxoSet {
+        let mut result = self.base.clone();
+        for key in self.deletions {
+            result.remove(&key_to_outpoint(&key));
+        }
+        for (outpoint, arc) in self.additions {
+            result.insert(outpoint, arc);
+        }
+        result
+    }
+}
+
 /// Implementation of UtxoLookup for UtxoOverlay.
-impl<'a> UtxoLookup for UtxoOverlay<'a> {
+impl<'a, B: UtxoLookup + ?Sized> UtxoLookup for UtxoOverlay<'a, B> {
     #[inline]
     fn get(&self, outpoint: &OutPoint) -> Option<&UTXO> {
         if self.has_deletions && self.deletions.contains(&outpoint_to_key(outpoint)) {
@@ -316,7 +316,7 @@ impl<'a> UtxoLookup for UtxoOverlay<'a> {
         if let Some(arc) = self.additions.get(outpoint) {
             return Some(arc.as_ref());
         }
-        self.base.get(outpoint).map(|a| a.as_ref())
+        self.base.get(outpoint)
     }
 
     #[inline]
@@ -365,8 +365,8 @@ pub fn to_fast_utxo_set(utxo_set: &UtxoSet) -> FastUtxoSet {
 ///
 /// Returns undo entries for use in block undo log (optional in validation phase).
 #[inline]
-pub fn apply_transaction_to_overlay(
-    overlay: &mut UtxoOverlay<'_>,
+pub fn apply_transaction_to_overlay<B: UtxoLookup + ?Sized>(
+    overlay: &mut UtxoOverlay<'_, B>,
     tx: &crate::types::Transaction,
     tx_id: crate::types::Hash,
     height: crate::types::Natural,
@@ -418,17 +418,108 @@ pub fn apply_transaction_to_overlay(
     undo_entries
 }
 
+/// Build a single consensus `UTXO` from a transaction output (shared by overlay apply + cache).
+#[inline]
+fn utxo_from_tx_output(
+    output: &crate::types::TransactionOutput,
+    height: crate::types::Natural,
+    is_coinbase: bool,
+) -> UTXO {
+    UTXO {
+        value: output.value,
+        script_pubkey: output.script_pubkey.as_slice().into(),
+        height,
+        is_coinbase,
+    }
+}
+
+/// Pre-build all block output UTXOs once (identical bytes to per-tx overlay apply).
+///
+/// Used on the assume-valid IBD path to reuse `Arc<UTXO>` across overlay inserts without
+/// changing consensus semantics — cache is built from the same block + tx_ids as apply.
+pub fn build_block_output_utxo_cache(
+    block: &crate::types::Block,
+    tx_ids: &[crate::types::Hash],
+    height: crate::types::Natural,
+) -> FxHashMap<OutPoint, std::sync::Arc<UTXO>> {
+    let cap: usize = block
+        .transactions
+        .iter()
+        .map(|tx| tx.outputs.len())
+        .sum();
+    let mut cache = FxHashMap::with_capacity_and_hasher(cap.max(1), Default::default());
+    for (ti, tx) in block.transactions.iter().enumerate() {
+        if ti >= tx_ids.len() {
+            break;
+        }
+        let tx_id = tx_ids[ti];
+        let is_cb = crate::transaction::is_coinbase(tx);
+        for (oi, output) in tx.outputs.iter().enumerate() {
+            let op = OutPoint {
+                hash: tx_id,
+                index: oi as u32,
+            };
+            cache.insert(
+                op,
+                std::sync::Arc::new(utxo_from_tx_output(output, height, is_cb)),
+            );
+        }
+    }
+    cache
+}
+
 /// Apply a transaction to the overlay WITHOUT building undo entries.
 ///
 /// This is the fast path for IBD where undo logs are discarded.
 /// Avoids cloning outpoints and UTXOs for undo entries, saving
 /// significant allocation overhead (2 clones per input, 2 per output).
 #[inline]
-pub fn apply_transaction_to_overlay_no_undo(
-    overlay: &mut UtxoOverlay<'_>,
+pub fn apply_transaction_to_overlay_no_undo<B: UtxoLookup + ?Sized>(
+    overlay: &mut UtxoOverlay<'_, B>,
     tx: &crate::types::Transaction,
     tx_id: crate::types::Hash,
     height: crate::types::Natural,
+) {
+    apply_transaction_to_overlay_no_undo_impl(overlay, tx, tx_id, height, None);
+}
+
+/// Same as [`apply_transaction_to_overlay_no_undo`] but reuses pre-built output `Arc`s.
+///
+/// `output_cache` must come from [`build_block_output_utxo_cache`] for the same block/height.
+/// Missing keys fall back to building the UTXO inline (consensus-safe defensive path).
+#[inline]
+pub fn apply_transaction_to_overlay_no_undo_with_output_cache<B: UtxoLookup + ?Sized>(
+    overlay: &mut UtxoOverlay<'_, B>,
+    tx: &crate::types::Transaction,
+    tx_id: crate::types::Hash,
+    height: crate::types::Natural,
+    output_cache: &FxHashMap<OutPoint, std::sync::Arc<UTXO>>,
+) {
+    apply_transaction_to_overlay_no_undo_impl(overlay, tx, tx_id, height, Some(output_cache));
+}
+
+/// Apply overlay mutation using optional pre-built output cache when present.
+#[inline]
+pub fn apply_transaction_to_overlay_no_undo_cached<B: UtxoLookup + ?Sized>(
+    overlay: &mut UtxoOverlay<'_, B>,
+    tx: &crate::types::Transaction,
+    tx_id: crate::types::Hash,
+    height: crate::types::Natural,
+    output_cache: Option<&FxHashMap<OutPoint, std::sync::Arc<UTXO>>>,
+) {
+    if let Some(cache) = output_cache {
+        apply_transaction_to_overlay_no_undo_with_output_cache(overlay, tx, tx_id, height, cache);
+    } else {
+        apply_transaction_to_overlay_no_undo(overlay, tx, tx_id, height);
+    }
+}
+
+fn apply_transaction_to_overlay_no_undo_impl<B: UtxoLookup + ?Sized>(
+    overlay: &mut UtxoOverlay<'_, B>,
+    tx: &crate::types::Transaction,
+    tx_id: crate::types::Hash,
+    height: crate::types::Natural,
+    output_cache: Option<&FxHashMap<OutPoint, std::sync::Arc<UTXO>>>,
 ) {
     let is_cb = crate::transaction::is_coinbase(tx);
 
@@ -443,14 +534,14 @@ pub fn apply_transaction_to_overlay_no_undo(
             index: i as u32,
         };
 
-        let utxo = UTXO {
-            value: output.value,
-            script_pubkey: output.script_pubkey.as_slice().into(),
-            height,
-            is_coinbase: is_cb,
-        };
+        if let Some(cache) = output_cache {
+            if let Some(arc) = cache.get(&outpoint) {
+                overlay.insert_arc(outpoint, std::sync::Arc::clone(arc));
+                continue;
+            }
+        }
 
-        overlay.insert(outpoint, utxo);
+        overlay.insert(outpoint, utxo_from_tx_output(output, height, is_cb));
     }
 }
 
@@ -577,6 +668,63 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(100),
             "Overlay creation took {elapsed:?} (expected no full base clone)"
+        );
+    }
+
+    #[test]
+    fn apply_cached_matches_direct_for_block_outputs() {
+        use crate::block::calculate_tx_id;
+        use crate::types::{Transaction, TransactionInput, TransactionOutput};
+
+        let fund = Transaction {
+            version: 1,
+            inputs: vec![TransactionInput {
+                prevout: make_outpoint(1),
+                script_sig: vec![].into(),
+                sequence: 0xffff_ffff,
+            }]
+            .into(),
+            outputs: vec![TransactionOutput {
+                value: 50_000,
+                script_pubkey: vec![1, 2, 3].into(),
+            }]
+            .into(),
+            lock_time: 0,
+        };
+        let fund_id = calculate_tx_id(&fund);
+        let mut base = UtxoSet::default();
+        crate::utxo_set_insert(&mut base, make_outpoint(1), make_utxo(50_000));
+
+        let block = crate::types::Block {
+            header: crate::types::BlockHeader::default(),
+            transactions: std::iter::once(fund.clone()).collect::<Vec<_>>().into(),
+        };
+        let tx_ids = vec![fund_id];
+        let cache = build_block_output_utxo_cache(&block, &tx_ids, 100);
+
+        let mut overlay_direct = UtxoOverlay::new(&base);
+        apply_transaction_to_overlay_no_undo(&mut overlay_direct, &fund, fund_id, 100);
+
+        let mut overlay_cached = UtxoOverlay::new(&base);
+        apply_transaction_to_overlay_no_undo_cached(
+            &mut overlay_cached,
+            &fund,
+            fund_id,
+            100,
+            Some(&cache),
+        );
+
+        assert_eq!(
+            overlay_direct.additions_len(),
+            overlay_cached.additions_len()
+        );
+        let op = OutPoint {
+            hash: fund_id,
+            index: 0,
+        };
+        assert_eq!(
+            overlay_direct.get(&op).map(|u| u.value),
+            overlay_cached.get(&op).map(|u| u.value)
         );
     }
 }

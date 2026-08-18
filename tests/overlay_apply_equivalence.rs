@@ -3,7 +3,10 @@
 use blvm_consensus::block::{apply_transaction, calculate_tx_id};
 use blvm_consensus::opcodes::{OP_1, OP_2, OP_3};
 use blvm_consensus::transaction::is_coinbase;
-use blvm_consensus::utxo_overlay::{UtxoOverlay, apply_transaction_to_overlay_no_undo};
+use blvm_consensus::utxo_overlay::{
+    UtxoOverlay, apply_transaction_to_overlay_no_undo,
+    apply_transaction_to_overlay_no_undo_with_output_cache, build_block_output_utxo_cache,
+};
 use blvm_consensus::{OutPoint, Transaction, TransactionInput, TransactionOutput, UTXO, UtxoSet};
 use std::sync::Arc;
 
@@ -190,4 +193,49 @@ fn overlay_apply_matches_pseudo_block_sequence() {
     let (base, _) = apply_transaction(&fund_b, base, 500).expect("fund b");
 
     assert_overlay_sequence_matches_direct(base, &[(spend, id_s, 501)]);
+}
+
+#[test]
+fn overlay_output_cache_matches_uncached_apply() {
+    let (fund_a, id_a) = sample_fund_tx(0x51, 500_000);
+    let (fund_b, _id_b) = sample_fund_tx(0x52, 600_000);
+    let (spend, _id_s) = sample_spend_tx(id_a, 450_000, OP_2);
+
+    let block = blvm_consensus::Block {
+        header: blvm_consensus::BlockHeader {
+            version: 1,
+            prev_block_hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+            timestamp: 1,
+            bits: 0x0f00ffff,
+            nonce: 0,
+        },
+        transactions: vec![fund_a.clone(), fund_b.clone(), spend.clone()].into(),
+    };
+    let tx_ids = [
+        calculate_tx_id(&fund_a),
+        calculate_tx_id(&fund_b),
+        calculate_tx_id(&spend),
+    ];
+    let height = 400_000u64;
+    let cache = build_block_output_utxo_cache(&block, &tx_ids, height);
+
+    let base = UtxoSet::default();
+    let mut overlay_uncached = UtxoOverlay::new(&base);
+    apply_transaction_to_overlay_no_undo(&mut overlay_uncached, &fund_a, tx_ids[0], height);
+    apply_transaction_to_overlay_no_undo(&mut overlay_uncached, &fund_b, tx_ids[1], height);
+    apply_transaction_to_overlay_no_undo(&mut overlay_uncached, &spend, tx_ids[2], height);
+
+    let mut overlay_cached = UtxoOverlay::new(&base);
+    apply_transaction_to_overlay_no_undo_with_output_cache(
+        &mut overlay_cached, &fund_a, tx_ids[0], height, &cache,
+    );
+    apply_transaction_to_overlay_no_undo_with_output_cache(
+        &mut overlay_cached, &fund_b, tx_ids[1], height, &cache,
+    );
+    apply_transaction_to_overlay_no_undo_with_output_cache(
+        &mut overlay_cached, &spend, tx_ids[2], height, &cache,
+    );
+
+    assert_utxo_sets_equal(&overlay_uncached.apply_to_base(), &overlay_cached.apply_to_base());
 }

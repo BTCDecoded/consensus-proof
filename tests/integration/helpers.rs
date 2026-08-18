@@ -115,6 +115,8 @@ pub fn verify_input_script(
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
 }
 
@@ -151,6 +153,8 @@ pub fn verify_against_utxo(
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     )
 }

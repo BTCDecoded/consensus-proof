@@ -7,3 +7,4 @@
 cc 094507761f46278c7a4495ff84907b75961b2d4f867463fd4256ea35db42cdb7 # shrinks to height1 = 23223, height2 = 77181
 cc 78b1351ce83a1dc59506e17c905d777f45eb4d50299e5f0d9a1aeba963ce7b8b # shrinks to bits = 241168170
 cc 6b8783ebc27ba96b552fcd15166c6a63c5c5d1b2f3ba963299bf93762402f7cb # shrinks to script_size = 59
+cc bde7fb071a6252ed4f783afb94b777d725e28b8a2c02c5ac545b65ab6c36237d # shrinks to input_count = 0, output_count = 1

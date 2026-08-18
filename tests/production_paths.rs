@@ -84,6 +84,8 @@ fn minimal_block_session() -> BlockSessionContext {
         ecdsa_sub_counters: Arc::new(vec![AtomicUsize::new(0)]),
         #[cfg(feature = "production")]
         schnorr_collector: None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        ecdsa_collector: None,
         height: 500_000,
         median_time_past: None,
         network: Network::Mainnet,
@@ -103,6 +105,7 @@ fn op1_script_check() -> ScriptCheck {
         spk_offset: 0,
         spk_len: 1,
         prevout_value: 10_000,
+        flags: 0,
     }
 }
 

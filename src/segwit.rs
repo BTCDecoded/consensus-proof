@@ -102,7 +102,7 @@ pub fn compute_witness_merkle_root(block: &Block, witnesses: &[Witness]) -> Resu
             }
         })
         .collect();
-    compute_witness_merkle_root_from_nested(block, &nested)
+    compute_witness_merkle_root_from_nested(block, &nested, None)
 }
 
 /// Double-SHA256 a byte slice, returning a 32-byte hash array.
@@ -135,6 +135,9 @@ fn hash_witness(witness: &Witness) -> Hash {
 /// Avoids allocating flattened structure in block validation hot path.
 /// Orange Paper 11.1.4: WitnessRoot = ComputeMerkleRoot({wtxid : tx ∈ block.transactions})
 ///
+/// When `tx_ids` is `Some`, non-SegWit leaves reuse `tx_ids[i]` (BIP141: wtxid == txid)
+/// instead of re-serializing and hashing. Block connect passes precomputed tx_ids.
+///
 /// BIP141 wtxid computation:
 ///   - coinbase: all zeros (hardcoded, consensus rule)
 ///   - non-SegWit tx (no witness data): wtxid = txid = sha256d(legacy serialization)
@@ -148,11 +151,21 @@ fn hash_witness(witness: &Witness) -> Hash {
 pub fn compute_witness_merkle_root_from_nested(
     block: &Block,
     witnesses: &[Vec<Witness>],
+    tx_ids: Option<&[Hash]>,
 ) -> Result<Hash> {
     if block.transactions.is_empty() {
         return Err(crate::error::ConsensusError::ConsensusRuleViolation(
             "Cannot compute witness merkle root from empty block".into(),
         ));
+    }
+    if let Some(ids) = tx_ids {
+        if ids.len() != block.transactions.len() {
+            return Err(crate::error::ConsensusError::ConsensusRuleViolation(format!(
+                "tx_ids length {} does not match block transaction count {}",
+                ids.len(),
+                block.transactions.len()
+            ).into()));
+        }
     }
     let mut witness_hashes = Vec::with_capacity(block.transactions.len());
     for (i, (tx, tx_witnesses)) in block.transactions.iter().zip(witnesses.iter()).enumerate() {
@@ -171,6 +184,9 @@ pub fn compute_witness_merkle_root_from_nested(
                         tx_witnesses,
                     );
                 sha256d_bytes(&serialized)
+            } else if let Some(ids) = tx_ids {
+                // Non-SegWit tx: wtxid = txid — reuse precomputed block tx_ids (connect hot path).
+                ids[i]
             } else {
                 // Non-SegWit tx: wtxid = txid = sha256d(version || inputs || outputs || locktime)
                 let serialized = crate::serialization::transaction::serialize_transaction(tx);
@@ -216,12 +232,21 @@ pub fn validate_witness_commitment(
     coinbase_witnesses: &[Witness],
 ) -> Result<bool> {
     // Extract the reserved nonce from coinbase input 0's witness stack.
-    // Per BIP141, it MUST be exactly 32 bytes; if absent default to 32 zero bytes.
-    let reserved_nonce: [u8; 32] = coinbase_witnesses
-        .first()
-        .and_then(|w| w.first())
-        .and_then(|item| item.as_slice().try_into().ok())
-        .unwrap_or([0u8; 32]);
+    // BIP141: if a coinbase witness stack is present and non-empty, it MUST be
+    // exactly one 32-byte item. Empty / absent → 32 zero bytes (no-witness hash).
+    let reserved_nonce: [u8; 32] = if let Some(w) = coinbase_witnesses.first() {
+        if w.is_empty() {
+            [0u8; 32]
+        } else if w.len() == 1 && w[0].len() == 32 {
+            let mut n = [0u8; 32];
+            n.copy_from_slice(&w[0][..32]);
+            n
+        } else {
+            return Ok(false);
+        }
+    } else {
+        [0u8; 32]
+    };
 
     // Compute the expected commitment: sha256d(witness_root || reserved_nonce)
     let mut preimage = [0u8; 64];
@@ -388,7 +413,7 @@ pub fn validate_segwit_block(
                 }
             })
             .collect();
-        let witness_root = compute_witness_merkle_root_from_nested(block, &nested)?;
+        let witness_root = compute_witness_merkle_root_from_nested(block, &nested, None)?;
         let coinbase_witness = if witnesses.is_empty() {
             &[][..]
         } else {

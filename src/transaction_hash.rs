@@ -214,10 +214,11 @@ pub type SighashMidstateCache =
 #[cfg(feature = "production")]
 thread_local! {
     static SIGHASH_MIDSTATE_CACHE: RefCell<LruCache<SighashCacheKey, [u8; 32]>> = RefCell::new({
+        // ATTR-rebind: P2PKH/sighash host binds collect HOL — larger TLS LRU (was 256k).
         let cap = std::env::var("BLVM_SIGHASH_MIDSTATE_CACHE_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(262_144)
+            .unwrap_or(1_048_576)
             .clamp(65_536, 2_097_152);
         LruCache::new(std::num::NonZeroUsize::new(cap).unwrap())
     });
@@ -421,6 +422,9 @@ fn sighash_with_cache(preimage: &[u8]) -> Hash {
 /// Compute legacy sighash without any caching layers.
 /// Uses incremental SHA256 - feeds data directly to the hasher, avoiding
 /// the preimage buffer allocation and double memory pass.
+///
+/// Note: plain-ALL specialized nocache (+ bucket WILLNEED default-on) REVERT S10
+/// 187.9 vs champ 197.9 (2026-07-31); keep unified path.
 #[cfg(feature = "production")]
 #[spec_locked("5.1.1", "CalculateSighash")]
 #[inline]
@@ -648,10 +652,11 @@ pub fn compute_sighashes_batch(
 
     let mut results = Vec::with_capacity(n);
 
+    // Plain SIGHASH_ALL: base 0x01 *or* legacy 0x00 (same blanking; raw byte in trailer).
     let all_sighash_all = sighash_bytes.iter().all(|&b| {
         let base = (b as u32) & 0x1f;
         let acp = (b as u32) & 0x80;
-        base == 0x01 && acp == 0
+        acp == 0 && (base == 0x01 || base == 0x00)
     });
 
     if !all_sighash_all || n <= 1 {
@@ -676,24 +681,14 @@ pub fn compute_sighashes_batch(
     }
     outputs_buf.extend_from_slice(&(tx.lock_time as u32).to_le_bytes());
 
-    // Forward midstates: state after version + varint(n) + blank_input_0 + ... + blank_input_{j-1}
+    // N8: single-pass forward midstate — one `Sha256::clone` per input (no Vec + second clone).
+    // `running` = state after version + varint(n) + blank_input_0 + ... + blank_input_{i-1}.
     let mut running = Sha256::new();
     running.update((tx.version as u32).to_le_bytes());
     update_varint(&mut running, n as u64);
 
-    let mut midstates: Vec<Sha256> = Vec::with_capacity(n);
-    for j in 0..n {
-        midstates.push(running.clone());
-        running.update(tx.inputs[j].prevout.hash);
-        running.update(tx.inputs[j].prevout.index.to_le_bytes());
-        running.update([0u8]);
-        running.update((tx.inputs[j].sequence as u32).to_le_bytes());
-    }
-
-    let sighash_u32_le = 0x01u32.to_le_bytes();
-
     for i in 0..n {
-        let mut h = midstates[i].clone();
+        let mut h = running.clone();
 
         // Input i with script_code
         h.update(tx.inputs[i].prevout.hash);
@@ -710,15 +705,21 @@ pub fn compute_sighashes_batch(
             h.update((tx.inputs[j].sequence as u32).to_le_bytes());
         }
 
-        // Outputs + locktime + sighash_type
+        // Outputs + locktime + per-input sighash byte (0x00 or 0x01)
         h.update(outputs_buf.as_slice());
-        h.update(sighash_u32_le);
+        h.update((sighash_bytes[i] as u32).to_le_bytes());
 
         let first_hash = h.finalize();
         let second_hash = Sha256::digest(first_hash);
         let mut result = [0u8; 32];
         result.copy_from_slice(&second_hash);
         results.push(result);
+
+        // Advance shared prefix past blank input i for the next midstate.
+        running.update(tx.inputs[i].prevout.hash);
+        running.update(tx.inputs[i].prevout.index.to_le_bytes());
+        running.update([0u8]);
+        running.update((tx.inputs[i].sequence as u32).to_le_bytes());
     }
 
     results
@@ -1850,6 +1851,9 @@ fn build_bip143_preimage(
 /// Batch compute BIP143 sighashes for all inputs.
 /// This is the optimal way to verify a SegWit transaction - compute precomputed
 /// hashes once, then calculate sighash for each input.
+///
+/// N7: when `sighash_type` is plain SIGHASH_ALL and `n ≥ 2`, share a SHA256 midstate after
+/// `version‖hashPrevouts‖hashSequence` (mirrors legacy `compute_sighashes_batch`).
 #[spec_locked("11.1.9", "ComputeWitnessSignatureHash")]
 pub fn batch_compute_bip143_sighashes(
     tx: &Transaction,
@@ -1871,6 +1875,17 @@ pub fn batch_compute_bip143_sighashes(
     // Compute precomputed hashes ONCE
     let precomputed = Bip143PrecomputedHashes::compute(tx, prevout_values, prevout_script_pubkeys);
 
+    let base = sighash_type & 0x1f;
+    let acp = sighash_type & 0x80;
+    if base == 0x01 && acp == 0 && tx.inputs.len() >= 2 {
+        return Ok(batch_bip143_sighash_all_midstate(
+            tx,
+            prevout_values,
+            script_codes,
+            &precomputed,
+        ));
+    }
+
     // Calculate sighash for each input using precomputed hashes
     let mut results = Vec::with_capacity(tx.inputs.len());
     for (i, (value, script_code)) in prevout_values.iter().zip(script_codes.iter()).enumerate() {
@@ -1879,6 +1894,45 @@ pub fn batch_compute_bip143_sighashes(
         results.push(sighash);
     }
     Ok(results)
+}
+
+/// N7: BIP143 SIGHASH_ALL midstate — clone SHA after common prefix, diverge per input.
+fn batch_bip143_sighash_all_midstate(
+    tx: &Transaction,
+    prevout_values: &[i64],
+    script_codes: &[&[u8]],
+    hashes: &Bip143PrecomputedHashes,
+) -> Vec<Hash> {
+    use sha2::{Digest, Sha256};
+    let n = tx.inputs.len();
+    let mut prefix = Sha256::new();
+    prefix.update((tx.version as u32).to_le_bytes());
+    prefix.update(hashes.hash_prevouts);
+    prefix.update(hashes.hash_sequence);
+
+    let mut suffix = [0u8; 40];
+    suffix[..32].copy_from_slice(&hashes.hash_outputs);
+    suffix[32..36].copy_from_slice(&(tx.lock_time as u32).to_le_bytes());
+    suffix[36..40].copy_from_slice(&0x01u32.to_le_bytes());
+
+    let mut results = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut h = prefix.clone();
+        let input = &tx.inputs[i];
+        h.update(input.prevout.hash);
+        h.update(input.prevout.index.to_le_bytes());
+        update_varint(&mut h, script_codes[i].len() as u64);
+        h.update(script_codes[i]);
+        h.update(prevout_values[i].to_le_bytes());
+        h.update((input.sequence as u32).to_le_bytes());
+        h.update(suffix);
+        let first = h.finalize();
+        let second = Sha256::digest(first);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&second);
+        results.push(out);
+    }
+    results
 }
 
 #[cfg(test)]
@@ -2190,6 +2244,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sighash0, sighash0_precomputed);
+
+        // N7: midstate batch == per-input BIP143 for SIGHASH_ALL.
+        let script_codes = [script_code.as_slice(), script_code.as_slice()];
+        let batched = batch_compute_bip143_sighashes(
+            &tx,
+            &prevout_values,
+            &prevout_script_pubkeys,
+            &script_codes,
+            0x01,
+        )
+        .unwrap();
+        assert_eq!(batched[0], sighash0);
+        assert_eq!(batched[1], sighash1);
     }
 
     #[test]

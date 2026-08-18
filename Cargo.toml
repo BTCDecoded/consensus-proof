@@ -27,8 +27,9 @@ smallvec = { version = "1.11", optional = true, features = ["serde", "const_gene
 # Fallback: enable the "secp256k1-fallback" feature to use crates.io secp256k1 0.28 (libsecp256k1 FFI).
 # Both deps are optional so only one is compiled at a time. NO secp256k1-fork.
 secp256k1 = { version = "0.28", optional = true }
-# blvm-secp256k1: pure Rust, BIP 341 correct TapTweak (use for Taproot path)
-blvm-secp256k1 = { version = ">=0.1, <1", optional = true }
+# blvm-secp256k1: pure Rust, BIP 341 correct TapTweak (use for Taproot path).
+# Path pin for monorepo (batch/GPU APIs); crates.io still works via version req when published.
+blvm-secp256k1 = { path = "../blvm-secp256k1", version = ">=0.1, <1", optional = true }
 # Enable SIMD optimizations for hashing
 # The "asm" feature enables optimized assembly implementations
 # Note: sha2-asm doesn't support Windows, so we use target-specific dependencies below
@@ -152,6 +153,8 @@ csfs = []
 # Use blvm-secp256k1 for Taproot tweak (correct BIP 341 tagged hash)
 # When disabled, uses crates.io secp256k1 (plain SHA256 - non-BIP341)
 blvm-secp256k1 = ["dep:blvm-secp256k1"]
+# Optional in-tree CUDA batch verify (blvm-secp256k1/gpu; requires nvcc + CUDA).
+secp-gpu = ["blvm-secp256k1", "blvm-secp256k1/gpu"]
 
 # Fallback crypto backend: crates.io secp256k1 0.28 (libsecp256k1 FFI, no batch Schnorr).
 # Use when blvm-secp256k1 is not desired. Mutually exclusive with blvm-secp256k1.

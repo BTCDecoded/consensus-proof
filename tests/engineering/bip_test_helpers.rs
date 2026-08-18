@@ -215,5 +215,7 @@ pub fn validate_with_context(
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
 }

@@ -95,6 +95,11 @@ pub mod bip113;
 pub mod bip119;
 #[cfg(any(feature = "csfs", feature = "production"))]
 pub mod bip348;
+#[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+pub mod ecdsa_batch;
+pub mod ecdsa_timers;
+#[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+pub mod ecdsa_wave;
 pub mod bip_validation;
 pub mod block;
 #[cfg(all(feature = "production", feature = "rayon"))]
@@ -464,6 +469,7 @@ impl ConsensusProof {
             None::<fn(&types::Hash, &reorganization::BlockUndoLog) -> error::Result<()>>,
             network_time,
             network,
+            None,
         )
     }
 
@@ -493,6 +499,7 @@ impl ConsensusProof {
             None::<fn(&types::Hash, &reorganization::BlockUndoLog) -> error::Result<()>>,
             network_time,
             network,
+            None,
         )
     }
 

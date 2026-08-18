@@ -39,7 +39,6 @@ fn test_csv_sequence_validation_passes() {
 }
 
 #[test]
-#[ignore = "CSV disabled-bit path: validate_with_context does not yet reject Ok(true) for disabled sequence"]
 fn test_csv_sequence_disabled_fails() {
     // CSV should fail if sequence is disabled (0x80000000 bit set)
     let input_sequence: u32 = 0x80000000; // Sequence disabled
@@ -335,7 +334,6 @@ fn test_csv_max_relative_locktime() {
 }
 
 #[test]
-#[ignore = "BIP68 disabled sequence encoding: pending script CSV enforcement"]
 fn test_csv_bip68_encoding() {
     // Test BIP68 sequence number encoding/decoding
     // Sequence = 0x80000000 (disabled) | 0x00400000 (time-based) | 0x0000ffff (value)

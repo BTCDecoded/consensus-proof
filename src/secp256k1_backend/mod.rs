@@ -66,6 +66,33 @@ pub fn verify_schnorr_batch(
     ))
 }
 
+/// ECDSA batch verify: returns `Vec<bool>` with one result per signature.
+/// Compact 64-byte sigs, 32-byte msgs, 33-byte compressed pubkeys.
+/// With `blvm-secp256k1` + optional `gpu` feature, large batches may use ufsecp CUDA.
+pub fn verify_ecdsa_batch(
+    sigs: &[[u8; 64]],
+    msgs: &[[u8; 32]],
+    pubkeys: &[[u8; 33]],
+) -> Result<Vec<bool>> {
+    #[cfg(feature = "blvm-secp256k1")]
+    return blvm_impl::verify_ecdsa_batch(sigs, msgs, pubkeys);
+
+    #[cfg(all(feature = "secp256k1-fallback", not(feature = "blvm-secp256k1")))]
+    {
+        let n = sigs.len().min(msgs.len()).min(pubkeys.len());
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(secp256k1_impl::verify_ecdsa(&msgs[i], &sigs[i], &pubkeys[i])?);
+        }
+        return Ok(out);
+    }
+
+    #[cfg(not(any(feature = "blvm-secp256k1", feature = "secp256k1-fallback")))]
+    Err(crate::error::ConsensusError::BlockValidation(
+        "no crypto backend enabled".into(),
+    ))
+}
+
 /// Direct ECDSA verify from DER sig bytes + pubkey bytes + msg hash.
 /// Uses blvm-secp256k1 directly (no libsecp256k1 FFI).
 /// Returns Some(true/false) or None on parse error.
