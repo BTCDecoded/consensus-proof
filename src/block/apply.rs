@@ -49,18 +49,23 @@ pub(crate) fn apply_transaction_with_id(
     bip30_index: &mut Option<&mut Bip30Index>,
     collect_undo: bool,
 ) -> Result<(UtxoSet, Vec<UndoEntry>)> {
-    assert!(
-        !tx.inputs.is_empty() || is_coinbase(tx),
-        "Transaction must have inputs unless it's a coinbase"
-    );
-    assert!(
-        !tx.outputs.is_empty(),
-        "Transaction must have at least one output"
-    );
-    assert!(
-        height <= i64::MAX as u64,
-        "Block height {height} must fit in i64"
-    );
+    // Preconditions → Err (not panic): structure should have rejected these under AV=0;
+    // under AV-skip IBD, apply is a fail-closed backstop.
+    if tx.inputs.is_empty() && !is_coinbase(tx) {
+        return Err(crate::error::ConsensusError::TransactionValidation(
+            "Transaction must have inputs unless it's a coinbase".into(),
+        ));
+    }
+    if tx.outputs.is_empty() {
+        return Err(crate::error::ConsensusError::TransactionValidation(
+            "Transaction must have at least one output".into(),
+        ));
+    }
+    if height > i64::MAX as u64 {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("Block height {height} must fit in i64").into(),
+        ));
+    }
 
     let mut undo_entries = if collect_undo {
         Vec::with_capacity(tx.inputs.len().saturating_add(tx.outputs.len()))
@@ -81,16 +86,12 @@ pub(crate) fn apply_transaction_with_id(
     }
 
     if !is_coinbase(tx) {
-        assert!(
-            !tx.inputs.is_empty(),
-            "Non-coinbase transaction must have inputs"
-        );
-
         for input in &tx.inputs {
-            assert!(
-                input.prevout.hash != [0u8; 32] || input.prevout.index != 0xffffffff,
-                "Prevout must be valid for non-coinbase input"
-            );
+            if input.prevout.hash == [0u8; 32] && input.prevout.index == 0xffffffff {
+                return Err(crate::error::ConsensusError::TransactionValidation(
+                    "Prevout must be valid for non-coinbase input".into(),
+                ));
+            }
 
             if let Some(arc) = utxo_set.remove(&input.prevout) {
                 let previous_utxo = arc.as_ref();
@@ -107,16 +108,15 @@ pub(crate) fn apply_transaction_with_id(
                     }
                 }
 
-                assert!(
-                    previous_utxo.value >= 0,
-                    "Previous UTXO value {} must be non-negative",
-                    previous_utxo.value
-                );
-                assert!(
-                    previous_utxo.value <= MAX_MONEY,
-                    "Previous UTXO value {} must not exceed MAX_MONEY",
-                    previous_utxo.value
-                );
+                if previous_utxo.value < 0 || previous_utxo.value > MAX_MONEY {
+                    return Err(crate::error::ConsensusError::EconomicValidation(
+                        format!(
+                            "Previous UTXO value {} must be in [0, MAX_MONEY]",
+                            previous_utxo.value
+                        )
+                        .into(),
+                    ));
+                }
 
                 if collect_undo {
                     undo_entries.push(UndoEntry {
@@ -124,42 +124,22 @@ pub(crate) fn apply_transaction_with_id(
                         previous_utxo: Some(std::sync::Arc::clone(&arc)),
                         new_utxo: None,
                     });
-                    assert!(
-                        undo_entries.len() <= tx.inputs.len() + tx.outputs.len(),
-                        "Undo entry count {} must be reasonable",
-                        undo_entries.len()
-                    );
                 }
             }
         }
     }
 
     for (i, output) in tx.outputs.iter().enumerate() {
-        assert!(
-            i < tx.outputs.len(),
-            "Output index {} out of bounds (transaction has {} outputs)",
-            i,
-            tx.outputs.len()
-        );
-        assert!(
-            output.value >= 0,
-            "Output value {} must be non-negative",
-            output.value
-        );
-        assert!(
-            output.value <= MAX_MONEY,
-            "Output value {} must not exceed MAX_MONEY",
-            output.value
-        );
+        if output.value < 0 || output.value > MAX_MONEY {
+            return Err(crate::error::ConsensusError::EconomicValidation(
+                format!("Output value {} must be in [0, MAX_MONEY]", output.value).into(),
+            ));
+        }
 
         let outpoint = OutPoint {
             hash: tx_id,
             index: i as u32,
         };
-        assert!(
-            i <= u32::MAX as usize,
-            "Output index {i} must fit in Natural"
-        );
 
         let utxo = UTXO {
             value: output.value,
@@ -167,12 +147,6 @@ pub(crate) fn apply_transaction_with_id(
             height,
             is_coinbase: is_coinbase(tx),
         };
-        assert!(
-            utxo.value == output.value,
-            "UTXO value {} must match output value {}",
-            utxo.value,
-            output.value
-        );
 
         let utxo_arc = std::sync::Arc::new(utxo);
         if collect_undo {
@@ -181,11 +155,6 @@ pub(crate) fn apply_transaction_with_id(
                 previous_utxo: None,
                 new_utxo: Some(std::sync::Arc::clone(&utxo_arc)),
             });
-            assert!(
-                undo_entries.len() <= tx.outputs.len() + tx.inputs.len(),
-                "Undo entry count {} must be reasonable",
-                undo_entries.len()
-            );
         }
 
         utxo_set.insert(outpoint, utxo_arc);
@@ -223,31 +192,31 @@ pub(crate) fn apply_transaction_with_id(
 
     let final_utxo_count = utxo_set.len();
     if is_coinbase(tx) {
-        assert!(
-            final_utxo_count >= initial_utxo_count,
-            "UTXO set size {final_utxo_count} must not decrease after coinbase (was {initial_utxo_count})"
-        );
-        assert!(
-            final_utxo_count <= initial_utxo_count + tx.outputs.len(),
-            "UTXO set size {} must not exceed initial {} + outputs {}",
-            final_utxo_count,
-            initial_utxo_count,
-            tx.outputs.len()
-        );
+        if final_utxo_count < initial_utxo_count
+            || final_utxo_count > initial_utxo_count + tx.outputs.len()
+        {
+            return Err(crate::error::ConsensusError::BlockValidation(
+                format!(
+                    "UTXO set size {final_utxo_count} out of range after coinbase (was {initial_utxo_count}, outputs {})",
+                    tx.outputs.len()
+                )
+                .into(),
+            ));
+        }
     } else {
-        let expected_change = tx.outputs.len() as i64 - tx.inputs.len() as i64;
         let actual_change = final_utxo_count as i64 - initial_utxo_count as i64;
         let lower = -(tx.inputs.len() as i64);
-        debug_assert!(
-            actual_change >= lower,
-            "UTXO set size change {actual_change} must be reasonable (expected ~{expected_change})"
-        );
+        if actual_change < lower {
+            return Err(crate::error::ConsensusError::BlockValidation(
+                format!("UTXO set size change {actual_change} below lower bound {lower}").into(),
+            ));
+        }
     }
-    assert!(
-        utxo_set.len() <= u32::MAX as usize,
-        "UTXO set size {} must not exceed maximum",
-        utxo_set.len()
-    );
+    if utxo_set.len() > u32::MAX as usize {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("UTXO set size {} must not exceed maximum", utxo_set.len()).into(),
+        ));
+    }
 
     Ok((utxo_set, undo_entries))
 }

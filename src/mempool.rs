@@ -58,11 +58,12 @@ pub fn accept_to_memory_pool(
             "Block height {height} exceeds i64::MAX"
         )));
     }
-    assert!(
-        utxo_set.len() <= u32::MAX as usize,
-        "UTXO set size {} exceeds maximum",
-        utxo_set.len()
-    );
+    if utxo_set.len() > u32::MAX as usize {
+        return Ok(MempoolResult::Rejected(format!(
+            "UTXO set size {} exceeds maximum",
+            utxo_set.len()
+        )));
+    }
     if let Some(wits) = witnesses {
         if wits.len() != tx.inputs.len() {
             return Ok(MempoolResult::Rejected(format!(
@@ -75,8 +76,11 @@ pub fn accept_to_memory_pool(
 
     // 1. Check if transaction is already in mempool
     let tx_id = crate::block::calculate_tx_id(tx);
-    // Invariant assertion: Transaction ID must be valid
-    assert!(tx_id != [0u8; 32], "Transaction ID must be non-zero");
+    if tx_id == [0u8; 32] {
+        return Err(ConsensusError::TransactionValidation(
+            "Transaction ID must be non-zero".into(),
+        ));
+    }
     if mempool.contains(&tx_id) {
         return Ok(MempoolResult::Rejected(
             "Transaction already in mempool".to_string(),
@@ -101,10 +105,12 @@ pub fn accept_to_memory_pool(
 
     // 3. Check inputs against UTXO set
     let (input_valid, fee) = check_tx_inputs(tx, utxo_set, height)?;
-    // Invariant assertion: Fee must be non-negative
-    assert!(fee >= 0, "Fee {fee} must be non-negative");
     use crate::constants::MAX_MONEY;
-    assert!(fee <= MAX_MONEY, "Fee {fee} must not exceed MAX_MONEY");
+    if fee < 0 || fee > MAX_MONEY {
+        return Ok(MempoolResult::Rejected(format!(
+            "Fee {fee} must be in [0, MAX_MONEY]"
+        )));
+    }
     if !matches!(input_valid, ValidationResult::Valid) {
         return Ok(MempoolResult::Rejected(
             "Invalid transaction inputs".to_string(),
@@ -250,31 +256,13 @@ pub fn is_standard_tx(tx: &Transaction) -> Result<bool> {
     }
 
     // 2. Check script sizes
-    for (i, input) in tx.inputs.iter().enumerate() {
-        // Bounds checking assertion: Input index must be valid
-        assert!(i < tx.inputs.len(), "Input index {i} out of bounds");
-        // Invariant assertion: Script size must be reasonable
-        assert!(
-            input.script_sig.len() <= MAX_SCRIPT_SIZE * 2,
-            "Script size {} must be reasonable for input {}",
-            input.script_sig.len(),
-            i
-        );
+    for input in tx.inputs.iter() {
         if input.script_sig.len() > MAX_SCRIPT_SIZE {
             return Ok(false);
         }
     }
 
-    for (i, output) in tx.outputs.iter().enumerate() {
-        // Bounds checking assertion: Output index must be valid
-        assert!(i < tx.outputs.len(), "Output index {i} out of bounds");
-        // Invariant assertion: Script size must be reasonable
-        assert!(
-            output.script_pubkey.len() <= MAX_SCRIPT_SIZE * 2,
-            "Script size {} must be reasonable for output {}",
-            output.script_pubkey.len(),
-            i
-        );
+    for output in tx.outputs.iter() {
         if output.script_pubkey.len() > MAX_SCRIPT_SIZE {
             return Ok(false);
         }
@@ -282,12 +270,7 @@ pub fn is_standard_tx(tx: &Transaction) -> Result<bool> {
 
     // 3. Check for standard script types and policy
     let mut op_return_count = 0usize;
-    for (i, output) in tx.outputs.iter().enumerate() {
-        // Bounds checking assertion: Output index must be valid
-        assert!(
-            i < tx.outputs.len(),
-            "Output index {i} out of bounds in standard check"
-        );
+    for output in tx.outputs.iter() {
         if !is_standard_script(&output.script_pubkey)? {
             return Ok(false);
         }
@@ -357,11 +340,11 @@ pub fn replacement_checks(
             "Existing transaction cannot be coinbase".to_string().into(),
         ));
     }
-    assert!(
-        utxo_set.len() <= u32::MAX as usize,
-        "UTXO set size {} exceeds maximum",
-        utxo_set.len()
-    );
+    if utxo_set.len() > u32::MAX as usize {
+        return Err(crate::error::ConsensusError::BlockValidation(
+            format!("UTXO set size {} exceeds maximum", utxo_set.len()).into(),
+        ));
+    }
 
     // 1. Check RBF signaling - existing transaction must signal RBF
     // Note: new_tx doesn't need to signal RBF per BIP125, only existing_tx does
@@ -370,45 +353,29 @@ pub fn replacement_checks(
     }
 
     // 2. Check fee rate: FeeRate(tx_2) > FeeRate(tx_1)
-    let new_fee = calculate_fee(new_tx, utxo_set)?;
-    let existing_fee = calculate_fee(existing_tx, utxo_set)?;
-    // Invariant assertion: Fees must be non-negative
-    assert!(new_fee >= 0, "New fee {new_fee} must be non-negative");
-    assert!(
-        existing_fee >= 0,
-        "Existing fee {existing_fee} must be non-negative"
-    );
+    // Missing prevouts → reject replacement (fail-closed; not a soft Ok fee).
+    let new_fee = match calculate_fee(new_tx, utxo_set) {
+        Ok(f) => f,
+        Err(crate::error::ConsensusError::UtxoNotFound(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let existing_fee = match calculate_fee(existing_tx, utxo_set) {
+        Ok(f) => f,
+        Err(crate::error::ConsensusError::UtxoNotFound(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
     use crate::constants::MAX_MONEY;
-    assert!(
-        new_fee <= MAX_MONEY,
-        "New fee {new_fee} must not exceed MAX_MONEY"
-    );
-    assert!(
-        existing_fee <= MAX_MONEY,
-        "Existing fee {existing_fee} must not exceed MAX_MONEY"
-    );
+    if new_fee < 0 || existing_fee < 0 || new_fee > MAX_MONEY || existing_fee > MAX_MONEY {
+        return Ok(false);
+    }
 
     let new_tx_size = calculate_transaction_size_vbytes(new_tx);
     let existing_tx_size = calculate_transaction_size_vbytes(existing_tx);
-    // Invariant assertion: Transaction sizes must be positive
-    assert!(
-        new_tx_size > 0,
-        "New transaction size {new_tx_size} must be positive"
-    );
-    assert!(
-        existing_tx_size > 0,
-        "Existing transaction size {existing_tx_size} must be positive"
-    );
-    assert!(
-        new_tx_size <= MAX_TX_SIZE * 2,
-        "New transaction size {new_tx_size} must be reasonable"
-    );
-    assert!(
-        existing_tx_size <= MAX_TX_SIZE * 2,
-        "Existing transaction size {existing_tx_size} must be reasonable"
-    );
-
-    if new_tx_size == 0 || existing_tx_size == 0 {
+    if new_tx_size == 0
+        || existing_tx_size == 0
+        || new_tx_size > MAX_TX_SIZE * 2
+        || existing_tx_size > MAX_TX_SIZE * 2
+    {
         return Ok(false);
     }
 
@@ -416,16 +383,6 @@ pub fn replacement_checks(
     // Compare: new_fee / new_tx_size > existing_fee / existing_tx_size
     // Equivalent to: new_fee * existing_tx_size > existing_fee * new_tx_size
     // This avoids floating-point division and precision errors
-
-    // Runtime assertion: Transaction sizes must be positive
-    debug_assert!(
-        new_tx_size > 0,
-        "New transaction size ({new_tx_size}) must be positive"
-    );
-    debug_assert!(
-        existing_tx_size > 0,
-        "Existing transaction size ({existing_tx_size}) must be positive"
-    );
 
     // Use integer multiplication to avoid floating-point precision issues
     // Check: new_fee * existing_tx_size > existing_fee * new_tx_size

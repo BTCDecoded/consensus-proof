@@ -57,6 +57,11 @@ pub fn check_coinbase_subsidy(
     subsidy: Integer,
     total_fees: Integer,
 ) -> bool {
+    // Negative fees/subsidy make the coinbase bound meaningless (connect already
+    // rejects total_fees < 0 before calling; this is defense-in-depth for other callers).
+    if total_fees < 0 || subsidy < 0 {
+        return false;
+    }
     let coinbase_output: i64 = match coinbase.outputs.iter().try_fold(0i64, |acc, output| {
         if output.value < 0 || output.value > MAX_MONEY {
             return None;
@@ -175,19 +180,17 @@ pub fn calculate_fee(tx: &Transaction, utxo_set: &UtxoSet) -> Result<Integer> {
         return Ok(0);
     }
 
-    // Use checked arithmetic to prevent overflow
-    let total_input: i64 = tx
-        .inputs
-        .iter()
-        .try_fold(0i64, |acc, input| {
-            let value = utxo_set
-                .get(&input.prevout)
-                .map(|utxo| utxo.value)
-                .unwrap_or(0);
-            acc.checked_add(value)
-                .ok_or_else(|| ConsensusError::EconomicValidation("Input value overflow".into()))
-        })
-        .map_err(|e| ConsensusError::EconomicValidation(Cow::Owned(e.to_string())))?;
+    // Use checked arithmetic to prevent overflow. Missing prevouts are outside
+    // CalculateFee's domain (Orange Paper assumes us(i.prevout).value) — fail closed.
+    let total_input: i64 = tx.inputs.iter().try_fold(0i64, |acc, input| {
+        let utxo = utxo_set.get(&input.prevout).ok_or_else(|| {
+            ConsensusError::UtxoNotFound(
+                format!("UTXO not found for prevout index {}", input.prevout.index).into(),
+            )
+        })?;
+        acc.checked_add(utxo.value)
+            .ok_or_else(|| ConsensusError::EconomicValidation("Input value overflow".into()))
+    })?;
 
     let total_output: i64 = tx
         .outputs
@@ -686,10 +689,36 @@ mod tests {
             lock_time: 0,
         };
 
-        // Should return error for negative fee (0 input - 100000000 output = negative)
+        // Missing prevout is outside CalculateFee domain → UtxoNotFound (not "Negative fee")
         let result = calculate_fee(&tx, &utxo_set);
         assert!(result.is_err());
-        assert!(matches!(result, Err(ConsensusError::EconomicValidation(_))));
+        assert!(matches!(result, Err(ConsensusError::UtxoNotFound(_))));
+    }
+
+    #[test]
+    fn test_check_coinbase_subsidy_rejects_negative_fees() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TransactionInput {
+                prevout: OutPoint {
+                    hash: [0; 32],
+                    index: 0xffffffff,
+                },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+            }]
+            .into(),
+            outputs: vec![TransactionOutput {
+                value: 1,
+                script_pubkey: vec![],
+            }]
+            .into(),
+            lock_time: 0,
+        };
+        // Tiny coinbase + negative fees would previously return true via checked_add wrap logic
+        assert!(!check_coinbase_subsidy(&coinbase, INITIAL_SUBSIDY, -1));
+        assert!(!check_coinbase_subsidy(&coinbase, -1, 0));
+        assert!(check_coinbase_subsidy(&coinbase, INITIAL_SUBSIDY, 0));
     }
 
     #[test]
