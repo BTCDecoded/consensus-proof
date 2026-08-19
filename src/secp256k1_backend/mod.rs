@@ -82,7 +82,11 @@ pub fn verify_ecdsa_batch(
         let n = sigs.len().min(msgs.len()).min(pubkeys.len());
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(secp256k1_impl::verify_ecdsa(&msgs[i], &sigs[i], &pubkeys[i])?);
+            out.push(secp256k1_impl::verify_ecdsa(
+                &msgs[i],
+                &sigs[i],
+                &pubkeys[i],
+            )?);
         }
         return Ok(out);
     }

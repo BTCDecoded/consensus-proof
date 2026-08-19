@@ -442,11 +442,7 @@ pub fn build_block_output_utxo_cache(
     tx_ids: &[crate::types::Hash],
     height: crate::types::Natural,
 ) -> FxHashMap<OutPoint, std::sync::Arc<UTXO>> {
-    let cap: usize = block
-        .transactions
-        .iter()
-        .map(|tx| tx.outputs.len())
-        .sum();
+    let cap: usize = block.transactions.iter().map(|tx| tx.outputs.len()).sum();
     let mut cache = FxHashMap::with_capacity_and_hasher(cap.max(1), Default::default());
     for (ti, tx) in block.transactions.iter().enumerate() {
         if ti >= tx_ids.len() {

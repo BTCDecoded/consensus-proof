@@ -160,11 +160,14 @@ pub fn compute_witness_merkle_root_from_nested(
     }
     if let Some(ids) = tx_ids {
         if ids.len() != block.transactions.len() {
-            return Err(crate::error::ConsensusError::ConsensusRuleViolation(format!(
-                "tx_ids length {} does not match block transaction count {}",
-                ids.len(),
-                block.transactions.len()
-            ).into()));
+            return Err(crate::error::ConsensusError::ConsensusRuleViolation(
+                format!(
+                    "tx_ids length {} does not match block transaction count {}",
+                    ids.len(),
+                    block.transactions.len()
+                )
+                .into(),
+            ));
         }
     }
     let mut witness_hashes = Vec::with_capacity(block.transactions.len());

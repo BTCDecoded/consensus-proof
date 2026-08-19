@@ -266,18 +266,20 @@ fn test_p2sh_p2wsh_nested_extra_scriptsig_push_fails() {
         script_pubkey: script_pubkey.into(),
     }];
     let flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
-    assert!(!verify_script_with_context(
-        &tx.inputs[0].script_sig,
-        &prevouts[0].script_pubkey,
-        Some(&witness),
-        flags,
-        &tx,
-        0,
-        &prevouts,
-        Some(SEGWIT_ACTIVATION_MAINNET),
-        Network::Mainnet,
-    )
-    .unwrap());
+    assert!(
+        !verify_script_with_context(
+            &tx.inputs[0].script_sig,
+            &prevouts[0].script_pubkey,
+            Some(&witness),
+            flags,
+            &tx,
+            0,
+            &prevouts,
+            Some(SEGWIT_ACTIVATION_MAINNET),
+            Network::Mainnet,
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -305,16 +307,18 @@ fn test_csv_input_sequence_disabled_fails() {
         value: 10_000,
         script_pubkey: script_pubkey.clone().into(),
     }];
-    assert!(!verify_script_with_context(
-        &tx.inputs[0].script_sig,
-        &script_pubkey,
-        None,
-        SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
-        &tx,
-        0,
-        &prevouts,
-        Some(500_000),
-        Network::Mainnet,
-    )
-    .unwrap());
+    assert!(
+        !verify_script_with_context(
+            &tx.inputs[0].script_sig,
+            &script_pubkey,
+            None,
+            SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+            &tx,
+            0,
+            &prevouts,
+            Some(500_000),
+            Network::Mainnet,
+        )
+        .unwrap()
+    );
 }

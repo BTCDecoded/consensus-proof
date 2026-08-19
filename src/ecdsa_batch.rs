@@ -7,7 +7,7 @@
 //! ## Opt-in accelerators
 //! - Lock-free SoA writes when constructed with `serial_ibd=true` (IBD path).
 //! - `BLVM_ECDSA_FLUSH_CHUNK=N` (N≥64): async mid-block verify enqueue; join before accept.
-//!   Prefer `BLVM_SECP_GPU_SUBMITTERS=1` + `secp-gpu` for true GPU overlap.
+//!   Prefer `BLVM_SECP_GPU_SUBMITTERS=1` (GPU overlap when CUDA is linked).
 //! - `BLVM_ECDSA_WAVE=1`: park SoA via [`take_owned_soa`] for orch two-phase wave.
 
 #[cfg(feature = "production")]
@@ -147,11 +147,7 @@ impl EcdsaSignatureCollector {
             .map(|s| s.next_slot.load(Ordering::Relaxed))
             .unwrap_or(0);
         let flushed = self.flushed_upto.load(Ordering::Relaxed);
-        let inflight_empty = self
-            .inflight
-            .lock()
-            .map(|g| g.is_empty())
-            .unwrap_or(true);
+        let inflight_empty = self.inflight.lock().map(|g| g.is_empty()).unwrap_or(true);
         let pending_empty = self
             .multisig_pending
             .lock()
@@ -267,8 +263,7 @@ impl EcdsaSignatureCollector {
                 }
             }
         }
-        self.overflow
-            .push((global_index, *msg, *pubkey33, *sig64));
+        self.overflow.push((global_index, *msg, *pubkey33, *sig64));
         let _ = self.next_idx.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -323,38 +318,29 @@ impl EcdsaSignatureCollector {
         };
 
         let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
-        #[cfg(feature = "secp-gpu")]
+        if let Some(gpu_rx) =
+            blvm_secp256k1::gpu::enqueue_ecdsa_job(msgs.clone(), pks.clone(), sigs.clone())
         {
-            if let Some(gpu_rx) =
-                blvm_secp256k1::gpu::enqueue_ecdsa_job(msgs.clone(), pks.clone(), sigs.clone())
-            {
-                std::thread::spawn(move || {
-                    let out = match gpu_rx.recv() {
-                        Ok(Some(v)) => Ok(v),
-                        Ok(None) | Err(_) => crate::secp256k1_backend::verify_ecdsa_batch(
-                            &sigs, &msgs, &pks,
-                        ),
-                    };
-                    let _ = rtx.send(out);
-                });
-                if let Ok(mut g) = self.inflight.lock() {
-                    g.push(InflightChunk {
-                        indices,
-                        rx: rrx,
-                    });
-                }
-                return;
+            std::thread::spawn(move || {
+                let out = match gpu_rx.recv() {
+                    Ok(Some(v)) => Ok(v),
+                    Ok(None) | Err(_) => {
+                        crate::secp256k1_backend::verify_ecdsa_batch(&sigs, &msgs, &pks)
+                    }
+                };
+                let _ = rtx.send(out);
+            });
+            if let Ok(mut g) = self.inflight.lock() {
+                g.push(InflightChunk { indices, rx: rrx });
             }
+            return;
         }
         std::thread::spawn(move || {
             let out = crate::secp256k1_backend::verify_ecdsa_batch(&sigs, &msgs, &pks);
             let _ = rtx.send(out);
         });
         if let Ok(mut g) = self.inflight.lock() {
-            g.push(InflightChunk {
-                indices,
-                rx: rrx,
-            });
+            g.push(InflightChunk { indices, rx: rrx });
         }
     }
 
@@ -455,9 +441,8 @@ impl EcdsaSignatureCollector {
                                 &inner.msgs[start..n],
                                 &inner.pubkeys[start..n],
                             )?;
-                            merged.extend(
-                                (start..n).map(|i| (inner.indices[i], results[i - start])),
-                            );
+                            merged
+                                .extend((start..n).map(|i| (inner.indices[i], results[i - start])));
                         }
                     }
                 } else {
@@ -496,8 +481,7 @@ impl EcdsaSignatureCollector {
     /// Verify SoA + resolve deferred CHECKMULTISIG; P2PKH rows must all succeed.
     pub fn verify_batch(&self) -> Result<Vec<bool>> {
         let merged = self.verify_batch_indexed()?;
-        let map: std::collections::HashMap<usize, bool> =
-            merged.iter().copied().collect();
+        let map: std::collections::HashMap<usize, bool> = merged.iter().copied().collect();
         self.resolve_multisig_pending(&map)?;
         for &(idx, ok) in &merged {
             if !is_multisig_trial_index(idx) && !ok {
@@ -540,7 +524,8 @@ mod multisig_resolve_tests {
         map.insert(tag(3), false);
         map.insert(tag(4), true);
         // tag(5) absent
-        c.resolve_multisig_pending(&map).expect("2-of-3 with off-curve pub");
+        c.resolve_multisig_pending(&map)
+            .expect("2-of-3 with off-curve pub");
     }
 
     #[test]

@@ -1204,8 +1204,10 @@ pub fn verify_p2pkh_inline(
     network: crate::types::Network,
     precomputed_sighash_all: Option<[u8; 32]>,
     precomputed_p2pkh_hash: Option<[u8; 20]>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Result<bool> {
     let (signature_bytes, pubkey_bytes) = match parse_p2pkh_script_sig(script_sig) {
         Some(pair) => pair,
@@ -1242,8 +1244,10 @@ pub fn verify_p2pkh_inline_parsed(
     network: crate::types::Network,
     precomputed_sighash_all: Option<[u8; 32]>,
     precomputed_p2pkh_hash: Option<[u8; 20]>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Result<bool> {
     #[cfg(feature = "profile")]
     let _t0 = std::time::Instant::now();
@@ -1320,26 +1324,21 @@ pub fn verify_p2pkh_inline_parsed(
     #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
     if let Some((collector, global_idx)) = ecdsa_collect {
         // Defer secp to block-end batch (CPU / optional GPU). Need compressed pk + compact sig.
-        let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
-            der_sig,
-            strict_der,
-            enforce_low_s,
-        ) {
-            Some(c) => c,
-            None => return Ok(false),
-        };
+        let compact =
+            match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(der_sig, strict_der, enforce_low_s) {
+                Some(c) => c,
+                None => return Ok(false),
+            };
         let pk33 = match pubkey_bytes.len() {
             33 => {
                 let mut a = [0u8; 33];
                 a.copy_from_slice(pubkey_bytes);
                 a
             }
-            65 => {
-                match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
-                    Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
-                    None => return Ok(false),
-                }
-            }
+            65 => match blvm_secp256k1::ecdsa::ge_from_pubkey_bytes(pubkey_bytes) {
+                Some(ge) => blvm_secp256k1::ecdsa::ge_to_compressed(&ge),
+                None => return Ok(false),
+            },
             _ => return Ok(false),
         };
         #[cfg(feature = "profile")]
@@ -1380,8 +1379,10 @@ pub fn verify_p2pk_inline(
     input_index: usize,
     height: u64,
     network: crate::types::Network,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Result<bool> {
     let pk_len = script_pubkey.len() - 2; // 33 or 65
     let pubkey_bytes = &script_pubkey[1..1 + pk_len];
@@ -1430,14 +1431,11 @@ pub fn verify_p2pk_inline(
 
     #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
     if let Some((collector, global_idx)) = ecdsa_collect {
-        let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
-            der_sig,
-            strict_der,
-            enforce_low_s,
-        ) {
-            Some(c) => c,
-            None => return Ok(false),
-        };
+        let compact =
+            match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(der_sig, strict_der, enforce_low_s) {
+                Some(c) => c,
+                None => return Ok(false),
+            };
         let pk33 = match pubkey_bytes.len() {
             33 => {
                 let mut a = [0u8; 33];
@@ -1481,8 +1479,9 @@ fn try_verify_p2sh_multisig_fast_path(
     #[cfg(feature = "production")] sighash_cache: Option<
         &crate::transaction_hash::SighashMidstateCache,
     >,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collector: Option<
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+    >,
 ) -> Option<Result<bool>> {
     let _ = prevout_script_pubkeys;
     // P2SH scriptPubKey: OP_HASH160 PUSH_20 <20> OP_EQUAL
@@ -1561,32 +1560,30 @@ fn try_verify_p2sh_multisig_fast_path(
             }
             sig_empty.push(false);
             let sighash_byte = sig_bytes[sig_bytes.len() - 1];
-            let sighash = if let Some((_, h)) =
-                sighash_by_type.iter().find(|(b, _)| *b == sighash_byte)
-            {
-                *h
-            } else {
-                let sighash_type = SighashType::from_byte(sighash_byte);
-                let h = match calculate_transaction_sighash_single_input(
-                    tx,
-                    input_index,
-                    &cleaned,
-                    prevout_values[input_index],
-                    sighash_type,
-                    sighash_cache,
-                ) {
-                    Ok(h) => h,
-                    Err(e) => return Some(Err(e)),
+            let sighash =
+                if let Some((_, h)) = sighash_by_type.iter().find(|(b, _)| *b == sighash_byte) {
+                    *h
+                } else {
+                    let sighash_type = SighashType::from_byte(sighash_byte);
+                    let h = match calculate_transaction_sighash_single_input(
+                        tx,
+                        input_index,
+                        &cleaned,
+                        prevout_values[input_index],
+                        sighash_type,
+                        sighash_cache,
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    sighash_by_type.push((sighash_byte, h));
+                    h
                 };
-                sighash_by_type.push((sighash_byte, h));
-                h
-            };
             let der_sig = &sig_bytes[..sig_bytes.len() - 1];
             // Invalid DER / high-S: Core treats the sig as non-matching, not hard-fail
             // (NULLFAIL applied at resolve when the overall match fails).
-            let compact = blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
-                der_sig, strict_der, enforce_low_s,
-            );
+            let compact =
+                blvm_secp256k1::ecdsa::ecdsa_der_to_compact(der_sig, strict_der, enforce_low_s);
             for pubkey_bytes in &pubkeys {
                 let gidx = collector.alloc_multisig_trial_index();
                 trial_indices.push(gidx);
@@ -1895,8 +1892,10 @@ fn try_verify_p2sh_fast_path(
         &crate::transaction_hash::SighashMidstateCache,
     >,
     #[cfg(feature = "production")] precomputed_sighash_all: Option<[u8; 32]>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Option<Result<bool>> {
     const SCRIPT_VERIFY_P2SH: u32 = 0x01;
     if (flags & SCRIPT_VERIFY_P2SH) == 0 {
@@ -2011,12 +2010,8 @@ fn try_verify_p2sh_fast_path(
                 let strict_der = flags & 0x04 != 0;
                 let enforce_low_s = flags & 0x08 != 0;
                 if strict_der
-                    && !crate::bip_validation::check_bip66_network(
-                        signature_bytes,
-                        height,
-                        network,
-                    )
-                    .unwrap_or(false)
+                    && !crate::bip_validation::check_bip66_network(signature_bytes, height, network)
+                        .unwrap_or(false)
                 {
                     return Some(Ok(false));
                 }
@@ -2037,7 +2032,7 @@ fn try_verify_p2sh_fast_path(
                 #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
                 if let Some((collector, global_idx)) = ecdsa_collect {
                     // Default-on; set BLVM_P2SH_P2PKH_SOA=0 to disable.
-                    if !std::env::var_os("BLVM_P2SH_P2PKH_SOA").is_some_and(|v| v == "0") {
+                    if std::env::var_os("BLVM_P2SH_P2PKH_SOA").is_none_or(|v| v != "0") {
                         let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
                             der_sig,
                             strict_der,
@@ -2175,8 +2170,10 @@ pub fn verify_p2wpkh_inline(
     network: crate::types::Network,
     precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
     precomputed_sighash_all: Option<[u8; 32]>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Result<bool> {
     let signature_bytes = &witness[0];
     let pubkey_bytes = &witness[1];
@@ -2197,30 +2194,24 @@ pub fn verify_p2wpkh_inline(
         if let Some(precomp) = precomputed_sighash_all {
             precomp
         } else {
-            match crate::transaction_hash::calculate_bip143_sighash(
+            crate::transaction_hash::calculate_bip143_sighash(
                 tx,
                 input_index,
                 &p2pkh_script_code,
                 prevout_value,
                 sighash_byte,
                 precomputed_bip143,
-            ) {
-                Ok(h) => h,
-                Err(e) => return Err(e),
-            }
+            )?
         }
     } else {
-        match crate::transaction_hash::calculate_bip143_sighash(
+        crate::transaction_hash::calculate_bip143_sighash(
             tx,
             input_index,
             &p2pkh_script_code,
             prevout_value,
             sighash_byte,
             precomputed_bip143,
-        ) {
-            Ok(h) => h,
-            Err(e) => return Err(e),
-        }
+        )?
     };
 
     let der_sig = &signature_bytes[..signature_bytes.len() - 1];
@@ -2251,7 +2242,7 @@ pub fn verify_p2wpkh_inline(
     // Default-on SoA collect; set BLVM_P2WPKH_SOA=0 to disable (bisect).
     #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
     if let Some((collector, global_idx)) = ecdsa_collect {
-        if !std::env::var_os("BLVM_P2WPKH_SOA").is_some_and(|v| v == "0") {
+        if std::env::var_os("BLVM_P2WPKH_SOA").is_none_or(|v| v != "0") {
             let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
                 der_sig,
                 strict_der,
@@ -2307,8 +2298,10 @@ pub fn verify_p2wpkh_in_p2sh_inline(
     height: u64,
     network: crate::types::Network,
     precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Result<bool> {
     let expected_hash = &script_pubkey[2..22];
     let pushes = match parse_script_sig_push_only(script_sig) {
@@ -2345,17 +2338,14 @@ pub fn verify_p2wpkh_in_p2sh_inline(
 
     let p2pkh_script_code = bip143_p2wpkh_script_code(expected_pubkey_hash);
     let sighash_byte = signature_bytes[signature_bytes.len() - 1];
-    let sighash = match crate::transaction_hash::calculate_bip143_sighash(
+    let sighash = crate::transaction_hash::calculate_bip143_sighash(
         tx,
         input_index,
         &p2pkh_script_code,
         prevout_value,
         sighash_byte,
         precomputed_bip143,
-    ) {
-        Ok(h) => h,
-        Err(e) => return Err(e),
-    };
+    )?;
 
     let der_sig = &signature_bytes[..signature_bytes.len() - 1];
     let strict_der = flags & 0x04 != 0;
@@ -2384,7 +2374,7 @@ pub fn verify_p2wpkh_in_p2sh_inline(
     // Nested P2WPKH SoA: same gate as native (BLVM_P2WPKH_SOA=0 disables).
     #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
     if let Some((collector, global_idx)) = ecdsa_collect {
-        if !std::env::var_os("BLVM_P2WPKH_SOA").is_some_and(|v| v == "0") {
+        if std::env::var_os("BLVM_P2WPKH_SOA").is_none_or(|v| v != "0") {
             let compact = match blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
                 der_sig,
                 strict_der,
@@ -2442,8 +2432,10 @@ fn try_verify_p2wpkh_fast_path(
     network: crate::types::Network,
     precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
     #[cfg(feature = "production")] precomputed_sighash_all: Option<[u8; 32]>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Option<Result<bool>> {
     let _ = prevout_script_pubkeys;
     // P2WPKH: 22 bytes = OP_0 PUSH_20_BYTES <20-byte-hash>
@@ -2490,8 +2482,10 @@ fn try_verify_p2wpkh_in_p2sh_fast_path(
     block_height: Option<u64>,
     network: crate::types::Network,
     precomputed_bip143: Option<&crate::transaction_hash::Bip143PrecomputedHashes>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Option<Result<bool>> {
     let _ = prevout_script_pubkeys;
     const SCRIPT_VERIFY_P2SH: u32 = 0x01;
@@ -2558,8 +2552,9 @@ pub(crate) fn try_verify_p2wsh_in_p2sh_fast_path(
     #[cfg(feature = "production")] sighash_cache: Option<
         &crate::transaction_hash::SighashMidstateCache,
     >,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collector: Option<
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+    >,
 ) -> Option<Result<bool>> {
     const SCRIPT_VERIFY_P2SH: u32 = 0x01;
     if (flags & SCRIPT_VERIFY_P2SH) == 0 {
@@ -2630,8 +2625,9 @@ pub(crate) fn try_verify_p2wsh_fast_path(
     #[cfg(feature = "production")] sighash_cache: Option<
         &crate::transaction_hash::SighashMidstateCache,
     >,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collector: Option<&crate::ecdsa_batch::EcdsaSignatureCollector>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collector: Option<
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+    >,
 ) -> Option<Result<bool>> {
     // P2WSH: 34 bytes = OP_0 PUSH_32_BYTES <32-byte-hash>
     if script_pubkey.len() != 34 || script_pubkey[0] != OP_0 || script_pubkey[1] != PUSH_32_BYTES {
@@ -2829,7 +2825,9 @@ pub(crate) fn try_verify_p2wsh_fast_path(
                     };
                     let der_sig = &sig_bytes[..sig_bytes.len() - 1];
                     let compact = blvm_secp256k1::ecdsa::ecdsa_der_to_compact(
-                        der_sig, strict_der, enforce_low_s,
+                        der_sig,
+                        strict_der,
+                        enforce_low_s,
                     );
                     for pubkey_bytes in &pubkeys {
                         let gidx = collector.alloc_multisig_trial_index();
@@ -3127,8 +3125,10 @@ pub fn verify_script_with_context_full(
         &crate::transaction_hash::SighashMidstateCache,
     >,
     #[cfg(feature = "production")] precomputed_p2pkh_hash: Option<[u8; 20]>,
-    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-    ecdsa_collect: Option<(&crate::ecdsa_batch::EcdsaSignatureCollector, usize)>,
+    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))] ecdsa_collect: Option<(
+        &crate::ecdsa_batch::EcdsaSignatureCollector,
+        usize,
+    )>,
 ) -> Result<bool> {
     // libbitcoin-consensus check (multi-input verify_script): prevouts length must match vin size
     if prevout_values.len() != tx.inputs.len() || prevout_script_pubkeys.len() != tx.inputs.len() {

@@ -220,9 +220,10 @@ impl ScriptCheckQueue {
         let ecdsa_global_idx = ctx.ecdsa_index_base + check.input_idx;
 
         #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
-        let ecdsa_collect = session.ecdsa_collector.as_ref().map(|col| {
-            (col.as_ref(), ecdsa_global_idx)
-        });
+        let ecdsa_collect = session
+            .ecdsa_collector
+            .as_ref()
+            .map(|col| (col.as_ref(), ecdsa_global_idx));
 
         #[cfg(feature = "production")]
         let sighash_cache = ctx.sighash_midstate_cache.as_ref();

@@ -151,8 +151,7 @@ pub fn connect_block(
     #[cfg(not(all(feature = "production", feature = "rayon")))]
     let block_arc = None;
     let (result, new_utxo_set, _tx_ids, undo_log, _delta) = connect::connect_block_inner(
-        block, witnesses, utxo_set, None, height, context, None, None, block_arc, false, None,
-        None,
+        block, witnesses, utxo_set, None, height, context, None, None, block_arc, false, None, None,
     )?;
     Ok((result, new_utxo_set, undo_log))
 }
@@ -306,8 +305,9 @@ fn build_time_context<H: AsRef<BlockHeader>>(
 
 /// Pre-built IBD block output map (I2): shared `Arc<UTXO>` per outpoint.
 #[cfg(feature = "production")]
-pub type IbdBlockOutputCache =
-    std::sync::Arc<rustc_hash::FxHashMap<crate::types::OutPoint, std::sync::Arc<crate::types::UTXO>>>;
+pub type IbdBlockOutputCache = std::sync::Arc<
+    rustc_hash::FxHashMap<crate::types::OutPoint, std::sync::Arc<crate::types::UTXO>>,
+>;
 #[cfg(not(feature = "production"))]
 pub type IbdBlockOutputCache = std::sync::Arc<
     std::collections::HashMap<crate::types::OutPoint, std::sync::Arc<crate::types::UTXO>>,

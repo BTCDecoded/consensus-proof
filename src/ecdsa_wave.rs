@@ -9,8 +9,8 @@
 
 use crate::ecdsa_batch::OwnedEcdsaSoA;
 use crate::error::{ConsensusError, Result};
-use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn wave_enabled() -> bool {
@@ -175,11 +175,7 @@ fn flush_batch(batch: &mut Vec<WaveJob>, batch_sigs: &mut usize, deadline: &mut 
                     Ok(())
                 } else {
                     Err(ConsensusError::BlockValidation(
-                        format!(
-                            "Invalid ECDSA signature in wave height={}",
-                            job.height
-                        )
-                        .into(),
+                        format!("Invalid ECDSA signature in wave height={}", job.height).into(),
                     ))
                 };
                 let _ = job.reply.send(reply);
@@ -188,11 +184,7 @@ fn flush_batch(batch: &mut Vec<WaveJob>, batch_sigs: &mut usize, deadline: &mut 
         Err(e) => {
             for job in jobs {
                 let _ = job.reply.send(Err(ConsensusError::BlockValidation(
-                    format!(
-                        "ECDSA wave verify failed height={}: {e:?}",
-                        job.height
-                    )
-                    .into(),
+                    format!("ECDSA wave verify failed height={}: {e:?}", job.height).into(),
                 )));
             }
         }

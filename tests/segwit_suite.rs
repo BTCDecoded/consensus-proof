@@ -1,6 +1,7 @@
 //! COV-C-06d: SegWit weight, witness merkle, and commitment validation.
 
 use bitcoin_hashes::{Hash as BitcoinHash, sha256, sha256d};
+use blvm_consensus::block::{calculate_tx_id, compute_block_tx_ids};
 use blvm_consensus::constants::MAX_BLOCK_WEIGHT;
 use blvm_consensus::opcodes::{OP_0, OP_1, OP_CHECKSIG, OP_RETURN, PUSH_32_BYTES, PUSH_36_BYTES};
 use blvm_consensus::segwit::{
@@ -11,7 +12,6 @@ use blvm_consensus::segwit::{
 use blvm_consensus::{
     Block, BlockHeader, OutPoint, Transaction, TransactionInput, TransactionOutput,
 };
-use blvm_consensus::block::{calculate_tx_id, compute_block_tx_ids};
 
 const WITNESS_COMMITMENT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
@@ -327,15 +327,14 @@ fn test_witness_merkle_reuses_tx_ids_for_legacy_leaves() {
         transactions: vec![coinbase(50_000_000_000), legacy, segwit].into(),
     };
     let witnesses: Vec<Vec<Witness>> = vec![
-        vec![vec![vec![0x01; 32]]], // coinbase reserved nonce
-        vec![vec![]],               // legacy: empty witness stack
+        vec![vec![vec![0x01; 32]]],                 // coinbase reserved nonce
+        vec![vec![]],                               // legacy: empty witness stack
         vec![vec![vec![0x30; 72], vec![0x21; 33]]], // segwit signature + pubkey
     ];
     let tx_ids = compute_block_tx_ids(&block);
     let legacy_txid = calculate_tx_id(&block.transactions[1]);
 
-    let root_rehash =
-        compute_witness_merkle_root_from_nested(&block, &witnesses, None).unwrap();
+    let root_rehash = compute_witness_merkle_root_from_nested(&block, &witnesses, None).unwrap();
     let root_reuse =
         compute_witness_merkle_root_from_nested(&block, &witnesses, Some(&tx_ids)).unwrap();
     assert_eq!(
@@ -346,9 +345,7 @@ fn test_witness_merkle_reuses_tx_ids_for_legacy_leaves() {
 
     // Wrong tx_ids length is rejected before merkle computation.
     let bad_ids = vec![tx_ids[0]];
-    assert!(
-        compute_witness_merkle_root_from_nested(&block, &witnesses, Some(&bad_ids)).is_err()
-    );
+    assert!(compute_witness_merkle_root_from_nested(&block, &witnesses, Some(&bad_ids)).is_err());
 }
 
 #[test]

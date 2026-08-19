@@ -466,10 +466,7 @@ fn n8_legacy_midstate_batch_matches_nocache_and_micro() {
     }
     let nocache_ns = t1.elapsed().as_nanos() / 200;
     eprintln!("[N8 micro] batch≈{batch_ns} ns/tx nocache≈{nocache_ns} ns/tx (8-in)");
-    assert!(
-        batch_ns < nocache_ns,
-        "N8 batch should beat N× nocache"
-    );
+    assert!(batch_ns < nocache_ns, "N8 batch should beat N× nocache");
 }
 
 #[cfg(feature = "production")]

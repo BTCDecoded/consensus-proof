@@ -249,8 +249,8 @@ fn build_segwit_p2sh_p2wsh_spend_block() -> (Block, Vec<Vec<Witness>>, UtxoSet) 
         vec![vec![nonce.to_vec()]],
         vec![vec![witness_script.clone()]],
     ];
-    let witness_root =
-        compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None).expect("witness root");
+    let witness_root = compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None)
+        .expect("witness root");
 
     let mut coinbase = coinbase_at_height(height, subsidy);
     coinbase.outputs = vec![
@@ -317,8 +317,8 @@ fn build_segwit_p2wsh_spend_block() -> (Block, Vec<Vec<Witness>>, UtxoSet) {
         vec![vec![nonce.to_vec()]],
         vec![vec![witness_script.clone()]],
     ];
-    let witness_root =
-        compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None).expect("witness root");
+    let witness_root = compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None)
+        .expect("witness root");
 
     let mut coinbase = coinbase_at_height(height, subsidy);
     coinbase.outputs = vec![
@@ -404,8 +404,8 @@ fn build_taproot_script_path_spend_block() -> (Block, Vec<Vec<Witness>>, UtxoSet
         vec![vec![nonce.to_vec()]],
         vec![vec![tapscript.clone(), control_block]],
     ];
-    let witness_root =
-        compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None).expect("witness root");
+    let witness_root = compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None)
+        .expect("witness root");
 
     let mut coinbase = coinbase_at_height(height, subsidy);
     coinbase.outputs = vec![
@@ -431,8 +431,8 @@ fn build_segwit_witness_block(invalid_commitment: bool) -> (Block, Vec<Vec<Witne
     let coinbase = coinbase_at_height(height, subsidy);
     let witnesses: Vec<Vec<Witness>> = vec![vec![vec![nonce.to_vec()]]];
     let temp_block = block_with_txs_at(vec![coinbase.clone()], 1_500_353_985, 4);
-    let witness_root =
-        compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None).expect("witness root");
+    let witness_root = compute_witness_merkle_root_from_nested(&temp_block, &witnesses, None)
+        .expect("witness root");
     let commitment_spk = if invalid_commitment {
         witness_commitment_script(&[0xff; 32], &nonce)
     } else {

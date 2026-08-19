@@ -78,13 +78,6 @@ pub fn reorganize_chain(
                 .collect()
         })
         .collect();
-    debug_assert_eq!(
-        empty_witnesses.len(),
-        new_chain.len(),
-        "Witness count {} must match new chain block count {}",
-        empty_witnesses.len(),
-        new_chain.len()
-    );
 
     reorganize_chain_with_witnesses(
         new_chain,
@@ -427,6 +420,7 @@ pub fn reorganize_chain_with_witnesses(
 ///     None::<fn(&blvm_consensus::types::Hash, &blvm_consensus::reorganization::BlockUndoLog) -> blvm_consensus::error::Result<()>>,
 ///     0,
 ///     Network::Regtest,
+///     None,
 /// );
 /// if let Ok(reorg_result) = reorg_result {
 ///     let _removed = update_mempool_after_reorg(
@@ -1403,6 +1397,31 @@ mod tests {
 
         let result = reorganize_chain_test(&new_chain, &current_chain, utxo_set, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reorganize_disconnect_empty_tx_is_err() {
+        let ancestor = create_test_block_at_height(0);
+        let mut empty_tip = create_test_block_at_height(1);
+        empty_tip.transactions = Box::new([]);
+        empty_tip.header.nonce = 99;
+        let mut new_tip = create_test_block_at_height(1);
+        new_tip.header.nonce = 42;
+        let result = reorganize_chain_test(
+            &[ancestor.clone(), new_tip],
+            &[ancestor, empty_tip],
+            UtxoSet::default(),
+            1,
+        );
+        match result {
+            Err(crate::error::ConsensusError::BlockValidation(msg)) => {
+                assert!(
+                    msg.contains("must have at least one transaction"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected BlockValidation empty-tx, got {other:?}"),
+        }
     }
 
     #[test]

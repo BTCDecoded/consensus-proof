@@ -153,7 +153,8 @@ csfs = []
 # Use blvm-secp256k1 for Taproot tweak (correct BIP 341 tagged hash)
 # When disabled, uses crates.io secp256k1 (plain SHA256 - non-BIP341)
 blvm-secp256k1 = ["dep:blvm-secp256k1"]
-# Optional in-tree CUDA batch verify (blvm-secp256k1/gpu; requires nvcc + CUDA).
+# Force CUDA at compile (fails if nvcc missing). Default builds already
+# auto-link GPU when nvcc is found; runtime falls back to CPU if no device.
 secp-gpu = ["blvm-secp256k1", "blvm-secp256k1/gpu"]
 
 # Fallback crypto backend: crates.io secp256k1 0.28 (libsecp256k1 FFI, no batch Schnorr).

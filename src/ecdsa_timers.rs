@@ -6,8 +6,8 @@
 //! `collect_ms` is the entire `process_check` / script-check loop (not merely
 //! SoA append). `batch_ms` is deferred ECDSA/Schnorr `verify_batch`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -49,21 +49,20 @@ pub fn note_block_done() {
     }
     let b = BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
     let last = LAST_LOG_BLOCKS.load(Ordering::Relaxed);
-    if b == 1 || b.saturating_sub(last) >= 128 {
-        if LAST_LOG_BLOCKS
+    if (b == 1 || b.saturating_sub(last) >= 128)
+        && LAST_LOG_BLOCKS
             .compare_exchange(last, b, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-        {
-            let c = COLLECT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-            let v = BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-            let tot = c + v;
-            let pct = if tot > 0.0 { 100.0 * v / tot } else { 0.0 };
-            eprintln!(
-                "[BLVM_ECDSA_TIMERS] blocks={b} collect_ms={c:.1} batch_ms={v:.1} \
-                 batch_share={pct:.1}% (batch/(script_check_loop+batch); \
-                 collect_ms=whole process_check loop)"
-            );
-        }
+    {
+        let c = COLLECT_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let v = BATCH_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let tot = c + v;
+        let pct = if tot > 0.0 { 100.0 * v / tot } else { 0.0 };
+        eprintln!(
+            "[BLVM_ECDSA_TIMERS] blocks={b} collect_ms={c:.1} batch_ms={v:.1} \
+             batch_share={pct:.1}% (batch/(script_check_loop+batch); \
+             collect_ms=whole process_check loop)"
+        );
     }
 }
 

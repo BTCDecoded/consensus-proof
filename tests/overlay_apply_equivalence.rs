@@ -228,14 +228,29 @@ fn overlay_output_cache_matches_uncached_apply() {
 
     let mut overlay_cached = UtxoOverlay::new(&base);
     apply_transaction_to_overlay_no_undo_with_output_cache(
-        &mut overlay_cached, &fund_a, tx_ids[0], height, &cache,
+        &mut overlay_cached,
+        &fund_a,
+        tx_ids[0],
+        height,
+        &cache,
     );
     apply_transaction_to_overlay_no_undo_with_output_cache(
-        &mut overlay_cached, &fund_b, tx_ids[1], height, &cache,
+        &mut overlay_cached,
+        &fund_b,
+        tx_ids[1],
+        height,
+        &cache,
     );
     apply_transaction_to_overlay_no_undo_with_output_cache(
-        &mut overlay_cached, &spend, tx_ids[2], height, &cache,
+        &mut overlay_cached,
+        &spend,
+        tx_ids[2],
+        height,
+        &cache,
     );
 
-    assert_utxo_sets_equal(&overlay_uncached.apply_to_base(), &overlay_cached.apply_to_base());
+    assert_utxo_sets_equal(
+        &overlay_uncached.apply_to_base(),
+        &overlay_cached.apply_to_base(),
+    );
 }

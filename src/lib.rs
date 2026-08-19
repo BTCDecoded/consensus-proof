@@ -95,15 +95,15 @@ pub mod bip113;
 pub mod bip119;
 #[cfg(any(feature = "csfs", feature = "production"))]
 pub mod bip348;
+pub mod bip_validation;
+pub mod block;
+#[cfg(all(feature = "production", feature = "rayon"))]
+pub mod checkqueue;
 #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
 pub mod ecdsa_batch;
 pub mod ecdsa_timers;
 #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
 pub mod ecdsa_wave;
-pub mod bip_validation;
-pub mod block;
-#[cfg(all(feature = "production", feature = "rayon"))]
-pub mod checkqueue;
 pub mod economic;
 pub mod locktime;
 pub mod mempool;

@@ -106,7 +106,7 @@ pub fn accept_to_memory_pool(
     // 3. Check inputs against UTXO set
     let (input_valid, fee) = check_tx_inputs(tx, utxo_set, height)?;
     use crate::constants::MAX_MONEY;
-    if fee < 0 || fee > MAX_MONEY {
+    if !(0..=MAX_MONEY).contains(&fee) {
         return Ok(MempoolResult::Rejected(format!(
             "Fee {fee} must be in [0, MAX_MONEY]"
         )));

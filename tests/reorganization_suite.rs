@@ -503,12 +503,11 @@ fn test_reorganize_chain_with_witnesses_uses_undo_callbacks() {
 }
 
 #[test]
-#[should_panic(expected = "witness count")]
 fn test_reorganize_chain_with_witnesses_rejects_witness_block_mismatch() {
     let (current, utxo_at_tip) = connect_regtest_chain(2);
     let (longer, _, _) = connect_regtest_chain_with_undo(4);
 
-    let _ = reorganize_chain_with_witnesses(
+    let result = reorganize_chain_with_witnesses(
         &longer,
         &[],
         None,
@@ -523,6 +522,12 @@ fn test_reorganize_chain_with_witnesses_rejects_witness_block_mismatch() {
         Network::Regtest,
         None,
     );
+    match result {
+        Err(blvm_consensus::error::ConsensusError::BlockValidation(msg)) => {
+            assert!(msg.contains("witness count"), "unexpected message: {msg}");
+        }
+        other => panic!("expected BlockValidation witness-count mismatch, got {other:?}"),
+    }
 }
 
 #[test]

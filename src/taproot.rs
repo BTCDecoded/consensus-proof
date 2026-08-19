@@ -344,7 +344,7 @@ impl Bip341PrecomputedHashes {
 /// N7: reuse BIP341 commitments across inputs on the same thread (same `&Transaction` pointer).
 thread_local! {
     static BIP341_TLS: std::cell::RefCell<Option<(usize, Bip341PrecomputedHashes)>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 fn bip341_precompute(
