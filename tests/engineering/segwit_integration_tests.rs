@@ -929,7 +929,7 @@ fn test_segwit_validate_block_weight_limit() {
         .into(),
     };
 
-    let witnesses = vec![vec![vec![OP_1]]];
+    let witnesses = vec![vec![]]; // empty witness: valid coinbase reserved value (BIP141)
 
     let is_valid = validate_segwit_block(&block, &witnesses, MAX_BLOCK_WEIGHT as u64).unwrap();
 
