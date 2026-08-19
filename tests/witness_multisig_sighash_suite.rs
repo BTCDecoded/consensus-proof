@@ -27,11 +27,11 @@ fn build_p2wsh_1of2_multisig_spend() -> (
     let pk1 = PublicKey::from_secret_key(&secp, &sk1).serialize();
     let pk2 = PublicKey::from_secret_key(&secp, &sk2).serialize();
 
-    // OP_2 <pk1> <pk2> OP_1 OP_CHECKMULTISIG (1-of-2; pubkeys are raw, not push-wrapped)
-    let mut witness_script = vec![OP_2];
+    // 1-of-2: OP_1 <pk1> <pk2> OP_2 OP_CHECKMULTISIG (raw-key form accepted by parse_redeem_multisig)
+    let mut witness_script = vec![OP_1];
     witness_script.extend_from_slice(&pk1);
     witness_script.extend_from_slice(&pk2);
-    witness_script.push(OP_1);
+    witness_script.push(OP_2);
     witness_script.push(OP_CHECKMULTISIG);
 
     let wsh_hash = OptimizedSha256::new().hash(&witness_script);
