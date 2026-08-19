@@ -28,8 +28,8 @@ smallvec = { version = "1.11", optional = true, features = ["serde", "const_gene
 # Both deps are optional so only one is compiled at a time. NO secp256k1-fork.
 secp256k1 = { version = "0.28", optional = true }
 # blvm-secp256k1: pure Rust, BIP 341 correct TapTweak (use for Taproot path).
-# Path pin for monorepo (batch/GPU APIs); crates.io still works via version req when published.
-blvm-secp256k1 = { path = "../blvm-secp256k1", version = ">=0.1, <1", optional = true }
+# crates.io by default; monorepo dev: [patch.crates-io] below (stripped in CI).
+blvm-secp256k1 = { version = ">=0.1, <1", optional = true }
 # Enable SIMD optimizations for hashing
 # The "asm" feature enables optimized assembly implementations
 # Note: sha2-asm doesn't support Windows, so we use target-specific dependencies below
@@ -244,4 +244,7 @@ codegen-units = 16  # Faster compilation
 # blvm-spec-lock: crates.io by default; optional [patch.crates-io] for local spec-lock work
 # secp256k1: optional, activated only via "secp256k1-fallback" feature. blvm-secp256k1 is default backend. NO secp256k1-fork.
 
-# Monorepo: use sibling primitives so config types stay in sync before crates.io publish.
+# Monorepo: use sibling paths so config types stay in sync before crates.io publish.
+[patch.crates-io]
+blvm-secp256k1 = { path = "../blvm-secp256k1" }
+blvm-primitives = { path = "../blvm-primitives" }
