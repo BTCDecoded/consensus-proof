@@ -160,6 +160,8 @@ ad74926404162c5658b15167762103db22e387923ad0552e1c4a4355324313af85926d4266c0eaa8
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
     eprintln!("Direct redeem execution result (bypass P2SH): {:?}", r2);
 
@@ -330,6 +332,8 @@ fn test_block443992_via_context_full() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
     assert!(

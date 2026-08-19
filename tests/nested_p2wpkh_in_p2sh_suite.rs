@@ -195,6 +195,8 @@ fn test_p2wpkh_in_p2sh_verify_script_with_context_full() {
             None,
             #[cfg(feature = "production")]
             None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
         )
         .unwrap(),
         "sort-merge step6 API must accept valid P2WPKH-in-P2SH"

@@ -172,6 +172,8 @@ fn block_ibd_repro() {
                 None, // sighash_cache
                 #[cfg(feature = "production")]
                 None, // precomputed_p2pkh_hash
+                #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                None,
             );
             let is_target = tx_idx == 562;
             match &result {

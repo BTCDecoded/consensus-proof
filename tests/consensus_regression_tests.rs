@@ -110,6 +110,8 @@ fn test_p2sh_scriptsig_push_only_validation() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     // Must reject non-push opcode in P2SH scriptSig
@@ -204,6 +206,8 @@ fn test_taproot_empty_scriptsig_requirement() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 
@@ -584,6 +588,8 @@ fn test_script_flags_per_transaction() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 

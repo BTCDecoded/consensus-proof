@@ -4705,7 +4705,7 @@ fn eval_script_with_context_full_inner(
     }
 
     // No final stack check here — EvalScript behavior.
-    // Stack evaluation happens in verify_script_with_context_full (the VerifyScript equivalent)
+    // Stack evaluation happens in verify_script_with_context_full (the VerifyScript equivalent
     // after BOTH scriptSig and scriptPubKey have been executed.
     Ok(true)
 }

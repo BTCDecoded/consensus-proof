@@ -181,7 +181,10 @@ fuzz_target!(|data: &[u8]| {
                     None,
                     None,
                     None,
-                );
+                
+                    #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+                    None,
+        );
             }
         }
     }
@@ -232,6 +235,9 @@ fuzz_target!(|data: &[u8]| {
             None,
             None,
             None,
+            None,
+        
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
             None,
         );
     }
@@ -284,6 +290,9 @@ fuzz_target!(|data: &[u8]| {
             None,
             None,
             None,
+        
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
         );
     }
 
@@ -334,6 +343,9 @@ fuzz_target!(|data: &[u8]| {
             None,
             None,
             None,
+            None,
+        
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
             None,
         );
     }

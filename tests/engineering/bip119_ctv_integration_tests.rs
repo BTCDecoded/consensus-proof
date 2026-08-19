@@ -308,7 +308,10 @@ fn test_ctv_opcode_valid_template() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // CTV should pass with correct template hash
     assert!(result.is_ok() && result.unwrap(), "CTV should pass with valid template hash");
@@ -368,7 +371,10 @@ fn test_ctv_opcode_invalid_template() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // CTV should fail with wrong template hash
     assert!(result.is_ok() && !result.unwrap(), "CTV should fail with invalid template hash");
@@ -427,7 +433,10 @@ fn test_ctv_opcode_wrong_hash_size() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // CTV should fail with wrong hash size
     assert!(result.is_ok() && !result.unwrap(), "CTV should fail with wrong hash size");
@@ -481,7 +490,10 @@ fn test_ctv_opcode_empty_stack() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // CTV should fail with empty stack
     assert!(result.is_ok() && !result.unwrap(), "CTV should fail with empty stack");
@@ -561,7 +573,10 @@ fn test_ctv_transaction_validation_passes() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // Should pass: template hash matches
     assert!(result.is_ok() && result.unwrap(), "CTV transaction validation should pass");
@@ -640,7 +655,10 @@ fn test_ctv_transaction_validation_fails_wrong_structure() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // Should fail: template hash doesn't match tx2's structure
     assert!(result.is_ok() && !result.unwrap(), "CTV should fail when transaction structure doesn't match template");
@@ -808,7 +826,10 @@ fn test_ctv_vault_contract() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     assert!(result.is_ok() && result.unwrap(), "Vault withdrawal should pass with correct template");
 }
@@ -870,7 +891,10 @@ fn test_ctv_payment_channel() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     assert!(result.is_ok() && result.unwrap(), "Payment channel closure should pass with correct template");
 }
@@ -940,7 +964,10 @@ fn test_ctv_transaction_batching() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     assert!(result.is_ok() && result.unwrap(), "Transaction batching should pass with correct template");
 }
@@ -1324,7 +1351,10 @@ fn test_ctv_multiple_ctv_in_script() {
         None,
         #[cfg(feature = "production")]
         None,
-    );
+    
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
+        );
 
     // Should fail because second CTV has no hash on stack
     assert!(result.is_ok() && !result.unwrap(), "Multiple CTV opcodes should fail (second has no hash)");

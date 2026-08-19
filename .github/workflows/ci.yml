@@ -687,6 +687,8 @@ jobs:
       # cargo-fuzz injects sancov + ASAN; do not set RUSTFLAGS here.
       - name: Build fuzz binaries
         working-directory: fuzz
+        env:
+          BLVM_SECP256K1_NO_GPU: "1"
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"

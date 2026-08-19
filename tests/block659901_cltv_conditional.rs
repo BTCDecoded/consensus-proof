@@ -114,6 +114,8 @@ fn block659901_p2sh_cltv_zero_locktime_passes() {
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
     .expect("verify ok");
     assert!(

@@ -82,6 +82,8 @@ fn block709635_p2tr_keypath_65_byte_witness_passes() {
             None,
             None,
             None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
         )
         .expect("verify ok");
         assert!(

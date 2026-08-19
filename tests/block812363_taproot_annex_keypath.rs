@@ -78,6 +78,8 @@ fn taproot_keypath_with_annex_returns_result_not_error() {
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     // Invalid sig → Ok(false), never consensus Err from mis-parsed script-path.

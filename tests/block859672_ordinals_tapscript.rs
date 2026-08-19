@@ -71,6 +71,8 @@ fn block859672_ordinals_tapscript_input1() {
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
     assert_eq!(r, Ok(true), "Ordinals tapscript spend must verify: {:?}", r);
 }

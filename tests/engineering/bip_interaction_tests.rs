@@ -81,6 +81,8 @@ fn test_segwit_with_cltv() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     assert!(result.is_ok());
@@ -156,6 +158,8 @@ fn test_segwit_with_csv() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 
@@ -247,6 +251,8 @@ fn test_taproot_with_csv() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 
@@ -406,6 +412,8 @@ fn test_segwit_taproot_cltv_combined() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     assert!(result.is_ok());
@@ -492,6 +500,8 @@ fn test_cltv_csv_combined() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
     assert!(result_cltv.is_ok());
 
@@ -517,6 +527,8 @@ fn test_cltv_csv_combined() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
     // CSV: input sequence (5 blocks) >= required (4 blocks)

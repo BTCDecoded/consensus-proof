@@ -68,6 +68,8 @@ fn block909068_tapscript_annex_input0() {
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
     assert_eq!(
         r,

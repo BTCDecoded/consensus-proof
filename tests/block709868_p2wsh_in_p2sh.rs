@@ -61,6 +61,8 @@ fn block709868_p2wsh_in_p2sh_with_witness_pubkeytype_flag() {
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
     .unwrap();
     assert!(

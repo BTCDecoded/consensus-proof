@@ -80,6 +80,8 @@ fn test_bip65_cltv_compliance_basic() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     assert!(result.is_ok());
@@ -156,6 +158,8 @@ fn test_bip112_csv_compliance_basic() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 
@@ -262,6 +266,8 @@ fn test_bip65_cltv_type_mismatch_rejection() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     assert!(result.is_ok());
@@ -337,6 +343,8 @@ fn test_bip112_csv_disabled_sequence_rejection() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 

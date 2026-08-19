@@ -577,6 +577,8 @@ fn test_script_verification_rejects_bip66_violation() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     // Should fail due to invalid signature/DER
@@ -672,6 +674,8 @@ fn test_script_verification_rejects_bip147_violation() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     // Should fail due to BIP147 violation (non-empty dummy)
@@ -764,6 +768,8 @@ fn test_script_verification_allows_bip147_before_activation() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 

@@ -77,6 +77,8 @@ fn test_bip143_p2sh_p2wsh_6of6_multisig_from_tx_valid() {
             None,
             #[cfg(feature = "production")]
             None,
+            #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+            None,
         )
         .expect("script verify should not error"),
         "Core tx_valid BIP143 P2SH-P2WSH 6-of-6 multisig must verify"

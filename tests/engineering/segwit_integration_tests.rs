@@ -90,6 +90,8 @@ fn test_segwit_witness_validation() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     assert!(result.is_ok());
@@ -329,6 +331,8 @@ fn test_segwit_p2wpkh_validation() {
         None,
         #[cfg(feature = "production")]
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     );
 
     assert!(result.is_ok());
@@ -412,6 +416,8 @@ fn test_segwit_p2wsh_validation() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 
@@ -503,6 +509,8 @@ fn test_p2wsh_multisig_fast_path() {
         #[cfg(feature = "production")]
         None,
         #[cfg(feature = "production")]
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     );
 

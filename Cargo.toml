@@ -79,7 +79,7 @@ proptest = "=1.5.0"
 # Fuzzing framework for better test coverage ergonomics
 bolero = "0.11"
 # HTTP client for differential fuzzing
-reqwest = { version = "0.11", features = ["json"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 # Async runtime for differential fuzzing tests
 tokio = { version = "1.35", features = ["rt", "macros"] }
 # Performance benchmarking framework
@@ -163,7 +163,7 @@ secp256k1-fallback = ["dep:secp256k1"]
 
 
 [dependencies.lru]
-version = "0.16"
+version = "0.18"
 optional = true
 
 [dependencies.crossbeam-queue]

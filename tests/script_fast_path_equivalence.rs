@@ -89,6 +89,8 @@ fn assert_fast_path_equiv(
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
     .expect("fast path verify");
 
@@ -110,6 +112,8 @@ fn assert_fast_path_equiv(
         None,
         None,
         None,
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     )
     .expect("interpreter verify");
@@ -371,6 +375,8 @@ fn fast_path_equiv_invalid_p2pkh_sig_agrees_on_false() {
         None,
         None,
         None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
+        None,
     )
     .unwrap();
     disable_fast_paths(true);
@@ -391,6 +397,8 @@ fn fast_path_equiv_invalid_p2pkh_sig_agrees_on_false() {
         None,
         None,
         None,
+        None,
+        #[cfg(all(feature = "production", feature = "blvm-secp256k1"))]
         None,
     )
     .unwrap();
